@@ -1,0 +1,36 @@
+{
+  "schema_version": 1,
+  "name": "oh-isolated-chat",
+  "display_name": "Isolated Docker Chat",
+  "version": "0.1.0",
+  "description": "The host-side home for isolated Docker conversations: promote their memory into the durable store, and fork a conversation into a new one with its full history.",
+  "entrypoint": "extension.js",
+  "contributes": {
+    "pages": [
+      {
+        "id": "chat",
+        "title": "Isolated Docker Chat",
+        "path": "/chat",
+        "nav_label": "Isolated chat",
+        "description": "Conversations, their memory, and the host-side actions that isolated runtimes cannot perform themselves."
+      }
+    ]
+  },
+  "backend": {
+    "schema_version": 1,
+    "artifacts": {
+      "linux-amd64": {
+        "path": "backend/linux-amd64.tar.gz",
+        "sha256": "56c0006db8ce469a9467b48c2023bb2c757da344a6402929902d8bbe9f0ef302"
+      }
+    },
+    "argv": [
+      "{artifact_dir}/bin/isolated-chat-backend",
+      "--port={port}",
+      "--data-dir={data_dir}"
+    ],
+    "health": {
+      "path": "/health"
+    }
+  }
+}

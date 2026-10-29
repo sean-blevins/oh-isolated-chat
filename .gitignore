@@ -1,0 +1,9 @@
+# Staging directory for scripts/build-backend.sh — the pinned artifact in
+# backend/ is the committed output.
+build/
+
+# Validator dependency (see README "Build"); package-lock.json is committed.
+node_modules/
+
+# The unit tests import the extension-less backend by path.
+__pycache__/
