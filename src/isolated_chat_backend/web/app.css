@@ -1,0 +1,38 @@
+:root {
+  color-scheme: light dark;
+  --line: #d8dade; --muted: #6b7280; --accent: #2563eb;
+  --surface: #ffffff; --ink: #111827;
+}
+@media (prefers-color-scheme: dark) {
+  :root { --line: #33383f; --muted: #9aa2ad; --surface: #16181d; --ink: #e8eaed; }
+}
+* { box-sizing: border-box; }
+/* Paint surface and ink explicitly, on both elements. The host iframe carries
+   its own white element background, so leaving the canvas transparent pairs a
+   scheme-dependent default text colour with a white surface — white on white.
+   The accent stays the same in both schemes so white button text keeps its
+   contrast. */
+html, body { background-color: var(--surface); }
+body { margin: 0; padding: 24px; color: var(--ink); font: 14px/1.5 ui-sans-serif, system-ui, sans-serif; }
+h1 { font-size: 18px; margin: 0 0 4px; }
+h2 { font-size: 13px; text-transform: uppercase; letter-spacing: .04em; color: var(--muted); margin: 28px 0 8px; }
+p.lede { margin: 0 0 20px; color: var(--muted); max-width: 76ch; }
+table { border-collapse: collapse; width: 100%; }
+th, td { text-align: left; padding: 8px 10px; border-bottom: 1px solid var(--line); vertical-align: top; }
+th { font-size: 12px; text-transform: uppercase; letter-spacing: .04em; color: var(--muted); }
+code { font: 12px/1.5 ui-monospace, SFMono-Regular, Menlo, monospace; }
+button { font: inherit; padding: 6px 12px; border-radius: 8px; border: 1px solid var(--line); background: transparent; color: inherit; cursor: pointer; }
+button.primary { background: var(--accent); border-color: var(--accent); color: #fff; font-weight: 600; }
+button:disabled { opacity: .5; cursor: default; }
+.pending { font-weight: 600; }
+.pending.zero { font-weight: 400; color: var(--muted); }
+.bar { display: flex; align-items: center; gap: 12px; margin: 20px 0 0; }
+.status { color: var(--muted); }
+.actions { display: flex; gap: 8px; }
+pre { margin: 0; padding: 12px; border: 1px solid var(--line); border-radius: 8px; overflow: auto; max-height: 260px; white-space: pre-wrap; }
+.empty { color: var(--muted); font-style: italic; }
+.tier { color: var(--muted); font-size: 12px; }
+.name { font-weight: 600; }
+.note { color: var(--muted); }
+.chips { display: flex; flex-wrap: wrap; gap: 6px; margin-top: 6px; }
+.chip { padding: 1px 8px; border: 1px solid var(--line); border-radius: 999px; font-size: 11px; color: var(--muted); }

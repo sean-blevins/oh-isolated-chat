@@ -125,10 +125,18 @@ canvas-extension.json    manifest (schema 1): one page + one managed backend
 extension.js             host API 1 page bundle: registers the "chat" page, mounts
                          the backend view through host.appBackendView, and performs
                          Agent Server requests the backend cannot make
-backend/isolated-chat-backend   the host process: stdlib-only Python HTTP server
-                         (GET /health, GET /, GET /api/state, POST /api/promote,
-                         POST /api/clear)
-backend/linux-amd64.tar.gz  built artifact; digest pinned in the manifest
+src/launcher.py          runnable entry point, staged to bin/ in the artifact
+src/isolated_chat_backend/  the host process: stdlib-only Python package
+  persistence.py         the host store layout and conversation records
+  profiles.py            agent profiles and the durable memory key they own
+  memory.py              the promotion line union
+  state.py               the /api/state payload and the debug clear
+  server.py              HTTP routing (GET /health, /api/state, /, assets;
+                         POST /api/promote, /api/clear) plus asset serving
+  __main__.py            argv parsing, store discovery, serve loop
+  web/                   the backend view served to the iframe:
+                         index.html, app.css, app.js
+backend/linux-amd64.tar.gz  built artifact (bin/ + lib/); digest pinned in the manifest
 scripts/build-backend.sh builds the artifact and rewrites the pinned digest
 tests/test_isolated_chat_backend.py  unit tests for the union and path resolution
 docs/conversation-isolation-gaps.md  the original gap inventory (ISO-nn)
@@ -179,9 +187,13 @@ URL instead of a local path:
 { "source": "https://github.com/<owner>/oh-isolated-chat", "ref": "main" }
 ```
 
-For a monorepo, add `"repo_path": "<subdirectory>"`. Enable the app, then prepare
-and start its backend (approving the revision reported by `prepare`). Reload
-Canvas afterwards; the page appears as **Isolated chat** in the sidebar.
+For a monorepo, add `"repo_path": "<subdirectory>"`. Enable the app, then open
+the page from the sidebar (**Isolated chat**). The first visit shows the managed
+backend's status and a **Prepare and start** button: mounting a page never starts
+a backend, so the page asks for explicit consent, prepares and starts the pinned
+revision, and mounts the backend view once it is `ready`. Prepare, start, and
+approval all go through `host.agentServer.request`, so no revision or credential
+is chosen outside Canvas.
 
 If the bridge is unavailable the page still loads and explains what the Agent
 Server is missing instead of failing silently.

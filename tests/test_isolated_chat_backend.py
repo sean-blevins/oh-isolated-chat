@@ -3,25 +3,15 @@
 
 from __future__ import annotations
 
-import importlib.machinery
-import importlib.util
 import json
 import sys
 import tempfile
 from pathlib import Path
 
+SRC = Path(__file__).resolve().parents[1] / "src"
+sys.path.insert(0, str(SRC))
 
-BACKEND = Path(__file__).resolve().parents[1] / "backend" / "isolated-chat-backend"
-
-
-def load_backend():
-    spec = importlib.util.spec_from_loader(
-        "isolated_chat_backend",
-        importlib.machinery.SourceFileLoader("isolated_chat_backend", str(BACKEND)),
-    )
-    module = importlib.util.module_from_spec(spec)
-    spec.loader.exec_module(module)
-    return module
+from isolated_chat_backend import memory, persistence, profiles, state  # noqa: E402
 
 
 def make_tree(tmp: Path) -> Path:
@@ -39,41 +29,42 @@ def make_tree(tmp: Path) -> Path:
     return root
 
 
+def write_record(root: Path, hex_id: str, **fields: object) -> None:
+    directory = root / "agent-canvas" / "dev_conversations" / hex_id
+    directory.mkdir(parents=True, exist_ok=True)
+    (directory / "meta.json").write_text(json.dumps(fields))
+
+
 def test_union_appends_only_new_lines() -> None:
-    backend = load_backend()
     existing = "- a\n- b\n"
     incoming = "- b\n- c\n\n- d\n"
-    merged, added = backend.union_text(existing, incoming)
+    merged, added = memory.union_text(existing, incoming)
     assert merged == "- a\n- b\n- c\n- d\n", merged
     assert added == ["- c", "- d"], added
 
 
 def test_union_is_idempotent_and_keeps_existing_order() -> None:
-    backend = load_backend()
-    first, _ = backend.union_text("", "- a\n")
-    second, added = backend.union_text(first, "- a\n")
+    first, _ = memory.union_text("", "- a\n")
+    second, added = memory.union_text(first, "- a\n")
     assert second == first
     assert added == []
 
 
 def test_union_ignores_whitespace_only_differences() -> None:
-    backend = load_backend()
-    merged, added = backend.union_text("- keep\n", "   - keep   \n")
+    merged, added = memory.union_text("- keep\n", "   - keep   \n")
     assert merged == "- keep\n"
     assert added == []
 
 
 def test_find_persistence_root_walks_up_from_backend_data_dir() -> None:
-    backend = load_backend()
     with tempfile.TemporaryDirectory() as tmp:
         root = make_tree(Path(tmp))
         data_dir = root / "canvas-extensions" / "backends" / "data" / "oh-isolated-chat"
         data_dir.mkdir(parents=True)
-        assert backend.find_persistence_root(data_dir) == root
+        assert persistence.find_persistence_root(data_dir) == root
 
 
 def test_promote_writes_both_tiers_and_is_repeatable() -> None:
-    backend = load_backend()
     with tempfile.TemporaryDirectory() as tmp:
         root = make_tree(Path(tmp))
         hex_id = "aa11bb22cc33dd44"
@@ -82,7 +73,7 @@ def test_promote_writes_both_tiers_and_is_repeatable() -> None:
             json.dumps({"launched_agent_profile": {"agent_profile_id": "profile-1"}})
         )
 
-        first = backend.promote(root, hex_id)
+        first = memory.promote(root, hex_id)
         assert first["profile_key"] == "profile-1"
         assert first["profile_key_source"] == "launched"
         global_store = root / "memory" / "MEMORY.md"
@@ -94,13 +85,12 @@ def test_promote_writes_both_tiers_and_is_repeatable() -> None:
 
         # A second promotion adds nothing and must not rewrite the store.
         before = global_store.read_text()
-        second = backend.promote(root, hex_id)
+        second = memory.promote(root, hex_id)
         assert second["tiers"]["global"]["added"] == []
         assert global_store.read_text() == before
 
 
 def test_promote_appends_to_existing_durable_lines_in_order() -> None:
-    backend = load_backend()
     with tempfile.TemporaryDirectory() as tmp:
         root = make_tree(Path(tmp))
         hex_id = "aa11bb22cc33dd44"
@@ -108,7 +98,7 @@ def test_promote_appends_to_existing_durable_lines_in_order() -> None:
         store.parent.mkdir(parents=True)
         store.write_text("- durable: already here\n")
 
-        backend.promote(root, hex_id)
+        memory.promote(root, hex_id)
         assert store.read_text() == (
             "- durable: already here\n"
             "- global: user prefers tabs\n"
@@ -117,7 +107,6 @@ def test_promote_appends_to_existing_durable_lines_in_order() -> None:
 
 
 def test_profile_key_prefers_the_recorded_profile_over_the_default() -> None:
-    backend = load_backend()
     with tempfile.TemporaryDirectory() as tmp:
         root = make_tree(Path(tmp))
         hex_id = "aa11bb22cc33dd44"
@@ -128,16 +117,15 @@ def test_profile_key_prefers_the_recorded_profile_over_the_default() -> None:
         write_record(
             root, hex_id, launched_agent_profile={"agent_profile_id": "launched-1"}
         )
-        assert backend.profile_key(root, hex_id) == ("launched-1", "launched")
+        assert profiles.profile_key(root, hex_id) == ("launched-1", "launched")
 
 
 def test_profile_key_uses_the_default_profile_when_none_was_launched() -> None:
-    backend = load_backend()
     with tempfile.TemporaryDirectory() as tmp:
         root = make_tree(Path(tmp))
         hex_id = "aa11bb22cc33dd44"
         # No profile files at all: nothing to point the memory at.
-        assert backend.profile_key(root, hex_id) == ("default", "unresolved")
+        assert profiles.profile_key(root, hex_id) == ("default", "unresolved")
 
         (root / "agent-profiles").mkdir()
         (root / "agent-profiles" / "default.json").write_text(
@@ -151,11 +139,10 @@ def test_profile_key_uses_the_default_profile_when_none_was_launched() -> None:
         (root / "settings.json").write_text(
             json.dumps({"active_agent_profile_id": "profile-2"})
         )
-        assert backend.profile_key(root, hex_id) == ("default-1", "default")
+        assert profiles.profile_key(root, hex_id) == ("default-1", "default")
 
 
 def test_state_labels_profiles_by_name_and_flags_assumptions() -> None:
-    backend = load_backend()
     with tempfile.TemporaryDirectory() as tmp:
         root = make_tree(Path(tmp))
         (root / "settings.json").write_text(
@@ -176,7 +163,7 @@ def test_state_labels_profiles_by_name_and_flags_assumptions() -> None:
         (root / "runtime-data" / "bb11cc22dd33ee44").mkdir()
         write_record(root, "bb11cc22dd33ee44")
 
-        rows = {row["id"]: row for row in backend.conversation_state(root)}
+        rows = {row["id"]: row for row in state.conversation_state(root)}
         launched = rows["aa11bb22cc33dd44"]
         defaulted = rows["bb11cc22dd33ee44"]
         assert (launched["profile_key"], launched["profile_name"]) == (
@@ -192,32 +179,23 @@ def test_state_labels_profiles_by_name_and_flags_assumptions() -> None:
 
         (root / "memory" / "agents" / "profile-1").mkdir(parents=True)
         (root / "memory" / "agents" / "profile-1" / "MEMORY.md").write_text("- x\n")
-        durable = {file["key"]: file["name"] for file in backend.durable_state(root)}
+        durable = {file["key"]: file["name"] for file in state.durable_state(root)}
         assert durable["profile-1"] == "default"
 
 
 def test_missing_conversation_memory_is_not_an_error() -> None:
-    backend = load_backend()
     with tempfile.TemporaryDirectory() as tmp:
         root = make_tree(Path(tmp))
-        result = backend.promote(root, "ffffffffffffffff")
+        result = memory.promote(root, "ffffffffffffffff")
         assert result["tiers"]["global"]["present"] is False
         assert result["tiers"]["global"]["added"] == []
 
 
-def write_record(root: Path, hex_id: str, **fields: object) -> None:
-    directory = root / "agent-canvas" / "dev_conversations" / hex_id
-    directory.mkdir(parents=True, exist_ok=True)
-    (directory / "meta.json").write_text(json.dumps(fields))
-
-
 def test_conversation_title_prefers_the_stored_title() -> None:
-    backend = load_backend()
-    assert backend.conversation_title({"title": "  Save the thing  "}) == "Save the thing"
+    assert persistence.conversation_title({"title": "  Save the thing  "}) == "Save the thing"
 
 
 def test_conversation_title_falls_back_to_the_opening_message() -> None:
-    backend = load_backend()
     record = {
         "title": None,
         "initial_message": {
@@ -225,19 +203,17 @@ def test_conversation_title_falls_back_to_the_opening_message() -> None:
             "content": [{"type": "text", "text": "commit this to memory:\n\ndigdigdug: 2672"}],
         },
     }
-    assert backend.conversation_title(record) == "commit this to memory:"
+    assert persistence.conversation_title(record) == "commit this to memory:"
     long_message = {"initial_message": {"content": [{"text": "x" * 200}]}}
-    assert backend.conversation_title(long_message) == "x" * 80 + "…"
+    assert persistence.conversation_title(long_message) == "x" * 80 + "…"
 
 
 def test_conversation_title_is_untitled_without_evidence() -> None:
-    backend = load_backend()
-    assert backend.conversation_title({}) == "Untitled"
-    assert backend.conversation_title({"title": "   "}) == "Untitled"
+    assert persistence.conversation_title({}) == "Untitled"
+    assert persistence.conversation_title({"title": "   "}) == "Untitled"
 
 
 def test_display_tags_hides_reserved_keys_and_orders_the_rest() -> None:
-    backend = load_backend()
     record = {
         "tags": {
             "clientsource": "agentcanvas",
@@ -251,16 +227,15 @@ def test_display_tags_hides_reserved_keys_and_orders_the_rest() -> None:
     }
     # Reserved machine stamps stay hidden, priority keys lead, bare tags are
     # shown by key, and the rest sort A-Z.
-    assert backend.display_tags(record) == [
+    assert persistence.display_tags(record) == [
         ["origin", "automation"],
         ["alpha", "value"],
         ["zeta", ""],
     ]
-    assert backend.display_tags({}) == []
+    assert persistence.display_tags({}) == []
 
 
 def test_conversation_state_reports_name_and_tags() -> None:
-    backend = load_backend()
     with tempfile.TemporaryDirectory() as tmp:
         root = make_tree(Path(tmp))
         hex_id = "aa11bb22cc33dd44"
@@ -270,43 +245,41 @@ def test_conversation_state_reports_name_and_tags() -> None:
             title="Remember digdigdug",
             tags={"clientsource": "agentcanvas", "topic": "memory"},
         )
-        rows = backend.conversation_state(root)
+        rows = state.conversation_state(root)
         assert len(rows) == 1
         assert rows[0]["title"] == "Remember digdigdug"
         assert rows[0]["tags"] == [["topic", "memory"]]
 
 
 def test_clear_durable_removes_both_tiers_and_their_profile_dirs() -> None:
-    backend = load_backend()
     with tempfile.TemporaryDirectory() as tmp:
         root = make_tree(Path(tmp))
         hex_id = "aa11bb22cc33dd44"
         write_record(
             root, hex_id, launched_agent_profile={"agent_profile_id": "profile-1"}
         )
-        backend.promote(root, hex_id)
-        assert len(backend.durable_state(root)) == 2
+        memory.promote(root, hex_id)
+        assert len(state.durable_state(root)) == 2
 
-        removed = backend.clear_durable(root)
+        removed = state.clear_durable(root)
 
         assert len(removed) == 2
-        assert backend.durable_state(root) == []
+        assert state.durable_state(root) == []
         # The profile's directory existed only to hold the file just removed.
         assert not (root / "memory" / "agents" / "profile-1").exists()
 
 
 def test_clear_durable_leaves_the_conversation_able_to_promote_again() -> None:
-    backend = load_backend()
     with tempfile.TemporaryDirectory() as tmp:
         root = make_tree(Path(tmp))
         hex_id = "aa11bb22cc33dd44"
         write_record(
             root, hex_id, launched_agent_profile={"agent_profile_id": "profile-1"}
         )
-        backend.promote(root, hex_id)
-        backend.clear_durable(root)
+        memory.promote(root, hex_id)
+        state.clear_durable(root)
 
-        restored = backend.promote(root, hex_id)
+        restored = memory.promote(root, hex_id)
 
         assert restored["tiers"]["global"]["added"] == [
             "- global: user prefers tabs",
@@ -315,10 +288,9 @@ def test_clear_durable_leaves_the_conversation_able_to_promote_again() -> None:
 
 
 def test_clear_durable_on_an_empty_store_removes_nothing() -> None:
-    backend = load_backend()
     with tempfile.TemporaryDirectory() as tmp:
         root = make_tree(Path(tmp))
-        assert backend.clear_durable(root) == []
+        assert state.clear_durable(root) == []
 
 
 def main() -> int:

@@ -1,0 +1,44 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Isolated Docker Chat</title>
+<link rel="stylesheet" href="app.css">
+</head>
+<body>
+<h1>Isolated Docker Chat</h1>
+<p class="lede">
+  An isolated conversation runs in its own container: Canvas cannot fork it, and new conversations
+  start from an empty runtime directory. This page is the host side of that gap.
+  <strong>Promote</strong> merges a conversation's memory into the durable store that new
+  conversations are seeded from, as a line union: it only adds lines the durable store does not
+  already have, and never rewrites the conversation's copy. <strong>Fork</strong> copies a
+  conversation's full history and state into a new conversation, on the source's own LLM
+  profile or on another one you pick per row.
+</p>
+
+<div class="bar">
+  <button id="promote-all" class="primary">Promote all</button>
+  <span class="status" id="status"></span>
+</div>
+
+<h2>Conversations</h2>
+<table>
+  <thead>
+    <tr><th>Conversation</th><th>Global</th><th>Project / agent profile</th><th>Actions</th></tr>
+  </thead>
+  <tbody id="rows"></tbody>
+</table>
+
+<h2>Durable store</h2>
+<div class="bar">
+  <button id="clear-durable">Clear promoted memory (debug)</button>
+  <span class="note">Empties the store new conversations are seeded from. Conversations keep
+  their own copies, so promoting again restores what they still carry.</span>
+</div>
+<div id="durable"></div>
+
+<script src="app.js"></script>
+</body>
+</html>
