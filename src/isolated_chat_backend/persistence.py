@@ -111,6 +111,22 @@ def read_conversation_record(root: Path, hex_id: str) -> dict:
     return data if isinstance(data, dict) else {}
 
 
+def read_agent_settings(root: Path) -> dict | None:
+    """The stored agent source a launched conversation runs from, or None.
+
+    Canvas sends this on every start; an app that creates its own conversation
+    must supply it too, so read it from the same ``settings.json`` the Agent
+    Server persists. Returns None when the file or the field is missing, so the
+    caller can report "nothing to launch from" instead of sending a broken body.
+    """
+    try:
+        data = json.loads((root / SETTINGS_REL).read_text())
+    except (OSError, ValueError):
+        return None
+    settings = data.get("agent_settings")
+    return settings if isinstance(settings, dict) else None
+
+
 def conversation_title(record: dict) -> str:
     """The name Canvas shows for this conversation.
 

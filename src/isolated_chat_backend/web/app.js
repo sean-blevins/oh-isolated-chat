@@ -36,6 +36,32 @@ const tagChips = (tags) =>
         )
         .join("")}</div>`;
 
+// Handover state for a row: the chain (from / to), the hook's request, and
+// whether an artifact exists to hand over.
+const handoverChips = (convo) => {
+  const h = convo.handover ?? {};
+  const parts = [];
+  if (convo.handover_from) {
+    parts.push(`<span class="chip">from ${escapeHtml(short(convo.handover_from))}</span>`);
+  }
+  if (h.successor) {
+    parts.push(`<span class="chip">handed over to ${escapeHtml(short(h.successor))}</span>`);
+  }
+  if (h.requested) {
+    parts.push(
+      `<span class="chip warn">handover requested &middot; ${escapeHtml(h.reason ?? "?")}`
+      + `${h.runs != null ? ` (${h.runs}/${h.threshold})` : ""}</span>`,
+    );
+  }
+  if (h.doc) parts.push(`<span class="chip">handover.md</span>`);
+  return parts.length ? `<div class="chips">${parts.join("")}</div>` : "";
+};
+
+// A row can hand over once the hook has requested one or an artifact exists
+// (the agent may have written one on its own).
+const canHandOver = (convo) =>
+  Boolean(convo.handover && (convo.handover.requested || convo.handover.doc));
+
 // The LLM profile a row's fork runs on, "source's own" unless another is picked.
 // The table is rebuilt on every render, so the choice lives in forkProfiles.
 function profilePicker(convo) {
@@ -77,6 +103,7 @@ function render(state) {
       `<td><div class="name">${escapeHtml(convo.title)}</div>`
       + `<div class="tier"><code>${short(convo.id)}</code> &middot; ${profileLabel(convo)}</div>`
       + tagChips(convo.tags)
+      + handoverChips(convo)
       + `</td>`
       + `<td>${tierCell(convo.tiers.global)}</td>`
       + `<td>${tierCell(convo.tiers.profile)}</td>`;
@@ -87,12 +114,19 @@ function render(state) {
     button.textContent = "Promote";
     button.disabled = !(convo.tiers.global.pending + convo.tiers.profile.pending);
     button.addEventListener("click", () => promote(convo.id));
+    const handoverButton = document.createElement("button");
+    handoverButton.textContent = "Hand over";
+    handoverButton.title =
+      "Start a fresh conversation seeded with this conversation's handover.md — " +
+      "no context carried, linked back so the chain can be followed";
+    handoverButton.disabled = !canHandOver(convo);
+    handoverButton.addEventListener("click", () => handOver(convo));
     const forkButton = document.createElement("button");
     forkButton.textContent = "Fork";
     forkButton.title =
       "Copy this conversation's full history and state into a new conversation";
     forkButton.addEventListener("click", () => fork(convo));
-    actions.append(button, forkButton, profilePicker(convo));
+    actions.append(button, handoverButton, forkButton, profilePicker(convo));
     cell.append(actions);
     tr.append(cell);
     rows.append(tr);
@@ -120,7 +154,9 @@ async function refresh() {
   // Relative to the backend view's ingress mount (/app-backends/<name>/), so
   // the request stays inside the bridge path and carries the session cookie.
   const response = await fetch("api/state");
-  render(await response.json());
+  const state = await response.json();
+  render(state);
+  await maybeAutoHandover(state);
 }
 
 async function promote(conversation) {
@@ -229,6 +265,112 @@ async function fork(convo) {
   );
 }
 
+// Hand a conversation over: ask the backend to build the successor (artifact +
+// seeded plugin + chain link), then have the host page create it. The backend
+// runs the model judgement; ``auto`` respects a "hold" verdict, a manual click
+// is the user overruling it.
+async function handOver(convo, { auto = false } = {}) {
+  $("status").textContent = `preparing handover of ${short(convo.id)}…`;
+  const response = await fetch("api/handover", {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ conversation: convo.id, judge: true }),
+  });
+  const prepared = await response.json();
+  if (!response.ok) {
+    $("status").textContent = prepared.error ?? "handover failed";
+    return false;
+  }
+  const verdict = prepared.verdict;
+  if (verdict && verdict.handover === false && auto) {
+    $("status").textContent =
+      `handover held for ${short(convo.id)}: ${verdict.reason || "model said no"}`;
+    return false;
+  }
+  const id = prepared.conversation_id;
+  $("status").textContent = `starting successor ${short(id)}…`;
+  const result = await hostRequest("POST", "/api/conversations", {
+    conversation_id: id,
+    agent_settings: prepared.agent_settings,
+    // No parent_conversation_id: the Docker runtime rejects a parent its new
+    // container cannot see. The `handoverfrom` tag carries the chain instead.
+    tags: prepared.tags,
+    initial_message: {
+      role: "user",
+      content: [{ type: "text", text: prepared.initial_message }],
+    },
+  });
+  if (!result.ok) {
+    $("status").textContent = `start failed: ${result.error ?? "unknown error"}`;
+    return false;
+  }
+  const judged = verdict ? ` (model: ${verdict.handover ? "yes" : "no"})` : "";
+  $("status").textContent =
+    `handed ${short(convo.id)} over to ${short(id)}${judged} — opening it`;
+  window.parent.postMessage(
+    { source: CHANNEL, type: "navigate", path: `/conversations/${id}` },
+    "*",
+  );
+  return true;
+}
+
+// Auto-hand-over, page-driven: when the box is ticked and a row has a pending
+// request from the hook, hand it over. Guarded so a rebuild of the table does
+// not fire the same row twice.
+const autoHanded = new Set();
+async function maybeAutoHandover(state) {
+  if (!$("auto-handover").checked) return;
+  for (const convo of state.conversations) {
+    if (!canHandOver(convo) || convo.handover.successor) continue;
+    if (autoHanded.has(convo.id)) continue;
+    autoHanded.add(convo.id);
+    await handOver(convo, { auto: true });
+  }
+}
+
+// Start a conversation this app owns. Owning the id is what makes the seed
+// deterministic: the hook plugin is written into the conversation's runtime dir
+// *before* POST /api/conversations. A conversation created with an initial
+// message starts running inside that same call, so seeding afterwards would miss
+// the container's first run.
+async function startSeeded() {
+  const message = $("new-message").value.trim();
+  if (!message) {
+    $("status").textContent = "Enter a first message.";
+    return;
+  }
+  $("status").textContent = "seeding…";
+  const response = await fetch("api/seed", {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: "{}",
+  });
+  const seeded = await response.json();
+  if (!response.ok) {
+    $("status").textContent = seeded.error ?? "seed failed";
+    return;
+  }
+  const id = seeded.conversation_id;
+  $("status").textContent = `starting ${short(id)}…`;
+  // Only the host page holds Agent Server credentials, so it performs the
+  // create. It gets the id we already seeded and the stored agent source.
+  const result = await hostRequest("POST", "/api/conversations", {
+    conversation_id: id,
+    agent_settings: seeded.agent_settings,
+    initial_message: { role: "user", content: [{ type: "text", text: message }] },
+  });
+  if (!result.ok) {
+    $("status").textContent = `start failed: ${result.error ?? "unknown error"}`;
+    return;
+  }
+  $("status").textContent = `started ${short(id)} — opening it`;
+  $("new-message").value = "";
+  window.parent.postMessage(
+    { source: CHANNEL, type: "navigate", path: `/conversations/${id}` },
+    "*",
+  );
+}
+
 async function clearDurable() {
   if (
     !window.confirm(
@@ -253,6 +395,8 @@ async function clearDurable() {
 
 $("promote-all").addEventListener("click", () => promote("all"));
 $("clear-durable").addEventListener("click", () => clearDurable());
+$("new-seeded").addEventListener("click", startSeeded);
+$("auto-handover").addEventListener("change", refresh);
 (async () => {
   await loadProfiles();
   await refresh();

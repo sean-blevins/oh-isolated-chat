@@ -3,8 +3,11 @@
 The host side of isolated (Docker-runtime) conversations: one place for the
 things a container cannot do for itself.
 
-Three actions today:
+Four actions today:
 
+- **Start a seeded conversation** — create a conversation the app owns and seed
+  a hook plugin into it before it starts, so the container's first run already
+  has the hook (the app-side answer to host hooks never loading, ISO-13).
 - **Promote** — merge a conversation's memory into the durable host store that
   new conversations are seeded from (the host half of ISO-07).
 - **Fork** — copy a conversation's full history and state into a new
@@ -41,7 +44,7 @@ runtime directory is a bind mount. Promotion reads the conversation's
 | ISO-09 `switch_llm` / `switch_profile` → 501          | Agent Server contract                                     | pending (a fork picks a profile; an isolated conversation cannot switch in place) |
 | ISO-10 `credential-bindings` → 501                    | Agent Server contract                                     | pending                                                                           |
 | ISO-11 attach host folders; empty `/workspace`        | Agent Server contract                                     | pending                                                                           |
-| ISO-13 host hooks never load                          | Agent Server contract                                     | pending                                                                           |
+| ISO-13 host hooks never load                          | Handled here: a hook plugin seeded into a conversation this app starts | hosted (app-started conversations; see below)                                     |
 | ISO-19 `events/search` drops container-written events | Agent Server contract                                     | pending                                                                           |
 
 When an SDK gap closes, its surface belongs on this page next to Promote and
@@ -104,6 +107,78 @@ starts `idle`. The fork's first `run` resumes from the copied state, so the new
 conversation has the source's full event memory. Cost/token metrics start fresh.
 The title is `<source title> (fork)`, matching Canvas's own ` (branch)` suffix.
 
+## Starting a seeded conversation
+
+Hooks do not load from a bare `hooks.json`: the SDK reads them from the start
+request's `hook_config` and from whatever **plugins** the conversation discovers.
+`LocalConversation` merges plugin-contributed `hooks/hooks.json` into the hook
+config and runs `session_start` before the first LLM call; it never reads a hooks
+file off disk itself.
+
+The container's `HOME` is the per-conversation host directory
+`<runtime>/persistence` and its workspace is `<runtime>/workspace`, so the
+container scans `<runtime>/persistence/plugins/` and
+`<runtime>/workspace/.openhands/plugins/`. Seeding a plugin into either is how a
+hook reaches a conversation — no image change and no Agent Server change.
+
+`POST /api/seed` reserves the id (the app chooses it), writes the plugin under
+`<runtime>/persistence/plugins/handover-hook/`, and returns the id plus the
+stored `agent_settings` a launch needs. The page then asks the host to
+`POST /api/conversations` with that id and body. Owning the id is what makes it
+deterministic: a conversation created with an `initial_message` starts running
+inside that same call, so seeding after it is too late. (Canvas-started
+conversations pick their own id; covering those needs a filesystem watcher that
+seeds during container startup, which this app does not do yet.)
+
+The seeded plugin carries two things: a `handover` **skill** (AgentSkills format,
+`skills/handover/SKILL.md`) and a **hook** (`hooks/hooks.json` dispatching to
+`bin/hook.sh`). The hook runs on `session_start`, `user_prompt_submit` and
+`stop`: it appends to `.openhands/handover/hook.log`, records the conversation id
+once, and on `stop` counts runs and writes a *request* when a cheap threshold
+trips. It never calls a model — the expensive judgement is host-side. See
+**Handover** below.
+
+## Handover
+
+A handover starts a fresh conversation with **no carried context** — the point is
+to reset the window, not to fork it. The division of labor is deliberate:
+
+- **Detection is cheap and in-container.** The seeded hook runs on every `stop`.
+  It is deterministic: it counts completed runs, notices a trigger word (the user
+  can force a handover by typing "handover" / "hand over" / "/handover"), and
+  notices a marker. Only when one of those trips does it write a request under
+  `.openhands/handover/` in the conversation's workspace.
+- **Judgement and mechanics are host-side.** `POST /api/handover` reads the
+  request, optionally asks a model to confirm, then does what only the host can:
+  it reserves the successor id, seeds that successor's plugin *before* its
+  container starts, writes the handover artifact into the successor's workspace,
+  and links the chain. The host page performs the create, since it holds the
+  Agent Server credentials.
+- **The artifact is the content stage.** The agent is asked to author
+  `.openhands/handover/handover.md` (via the skill); when it has not, the host
+  writes a minimal, honest stub. Either way the successor's opening message
+  points at the artifact and carries nothing else.
+
+The chain is followed by a tag: the successor is created with
+`handoverfrom=<source hex>`, read back by `/api/state` as `handover_from`.
+`parent_conversation_id` is deliberately **not** used: the Docker runtime gives
+each conversation its own container, and the in-container server rejects a parent
+it cannot see there (HTTP 422), so a native parent link would make the successor
+fail to start.
+
+The page shows the chain (`from …` / `handed over to …`) and a **Hand over**
+button per row, enabled once the hook has requested one or an artifact exists. An
+**Auto-hand-over** checkbox hands over automatically when the hook requests one.
+
+> **Open item — the second gate.** The cheap gate is live. The optional model
+> judgement (`handover.judge`) reads the conversation's stored `agent_settings`,
+> but the `api_key` there is **encrypted** (the Agent Server decrypts it at
+> launch), so the judge's own HTTP call gets `401` and it fails open — the cheap
+> gate alone currently decides. Making stage two meaningful needs either a
+> decryptable key or, preferably, letting the conversation's *own* agent be the
+> larger model (the `stop` hook can deny the stop and point the agent at the
+> skill). See `plan.md` feature 9.
+
 ## Names and tags
 
 A row is identified the way Canvas identifies it: the conversation's stored
@@ -130,15 +205,20 @@ src/isolated_chat_backend/  the host process: stdlib-only Python package
   persistence.py         the host store layout and conversation records
   profiles.py            agent profiles and the durable memory key they own
   memory.py              the promotion line union
-  state.py               the /api/state payload and the debug clear
+  hooks.py               the seed plugin: manifest, hooks, the cheap gate
+                         script, and the handover skill, written into a new
+                         conversation's runtime dir before it starts
+  handover.py            host-side handover: read the cheap request, optional
+                         model judgement, build the artifact, seed the successor
+  state.py               the /api/state payload (incl. handover state) and the debug clear
   server.py              HTTP routing (GET /health, /api/state, /, assets;
-                         POST /api/promote, /api/clear) plus asset serving
+                         POST /api/seed, /api/handover, /api/promote, /api/clear)
   __main__.py            argv parsing, store discovery, serve loop
   web/                   the backend view served to the iframe:
                          index.html, app.css, app.js
 backend/linux-amd64.tar.gz  built artifact (bin/ + lib/); digest pinned in the manifest
 scripts/build-backend.sh builds the artifact and rewrites the pinned digest
-tests/test_isolated_chat_backend.py  unit tests for the union and path resolution
+tests/test_isolated_chat_backend.py  unit tests for the union, path resolution, the hook seed, and handover
 docs/conversation-isolation-gaps.md  the original gap inventory (ISO-nn)
 ```
 
@@ -163,13 +243,14 @@ bridge (`canvas_app_backend_bridge_v1`, released in Agent Server 1.56.0) and
 
 | Action  | Needs                                                                                                                              |
 | ------- | ---------------------------------------------------------------------------------------------------------------------------------- |
+| Start   | The Canvas App backend bridge, a Docker-runtime Agent Server, and a persisted `settings.json` with `agent_settings` to launch from. |
 | Promote | Nothing server-side to run it — it reads the conversation's files and writes the host store. Its **effect** (a new isolated conversation starting from the promoted memory) needs an Agent Server that seeds the durable store at container build. |
 | Fork    | Agent Server with the host-side Docker fork route; a stock release answers `501`.                                                   |
 
-Both are Agent Server contracts, not app code, so upstream releases will carry
-them; until they do, point the Agent Server at a checkout that has them. Without
-them the page still works: Promote only changes the host store, and each Fork row
-reports the server's error.
+All three are Agent Server contracts or app-host work, not image changes, so
+upstream releases will carry the contract half; until they do, point the Agent
+Server at a checkout that has them. Without them the page still works: Promote
+only changes the host store, and each Fork row reports the server's error.
 
 ## Install
 
@@ -219,3 +300,16 @@ Server is missing instead of failing silently.
   seeing the source's files.
 - The reserved tag key list is a copy of a frontend constant (see Names and
   tags); it can drift from Canvas until the same rule is exposed to apps.
+- Handover detection only fires at a **clean** `stop`: the SDK runs `Stop` hooks
+  when the agent reaches `FINISHED`, not when a run errors or is interrupted, so
+  a conversation that errors every turn never records a request.
+- A request is armed by writing a `runtime-data/<hex>` directory before the
+  conversation is created. If that create then fails, the directory is left
+  behind and the listing shows it as a row (the listing enumerates runtime
+  directories). Normal creates succeed; a rejected field is the failure mode to
+  watch.
+- Conversation containers trust the image's CA bundle. If the LLM gateway sits
+  behind a private CA (as the served uni.lux gateway does), the container cannot
+  reach it until that CA is present in the image or injected — the Agent Server
+  forwards only a fixed env allowlist and mounts only the conversation
+  directories, so there is no host-side knob for this today.

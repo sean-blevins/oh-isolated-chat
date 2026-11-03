@@ -5,6 +5,7 @@ from __future__ import annotations
 import time
 from pathlib import Path
 
+from . import handover
 from .memory import memory_paths, pending_lines, read_text
 from .persistence import (
     DURABLE_GLOBAL_REL,
@@ -47,9 +48,26 @@ def conversation_state(root: Path) -> list[dict[str, object]]:
                 "profile_key_source": key_source,
                 "profile_name": names.get(key, ""),
                 "tiers": tiers,
+                "handover": handover.status(root, hex_id),
+                "handover_from": _handover_from(record),
             }
         )
     return rows
+
+
+def _handover_from(record: dict) -> str | None:
+    """The conversation this one was handed over from, if any.
+
+    Prefer the tag the app stamps at creation; fall back to the recorded parent
+    so a chain is still visible if the tag was dropped.
+    """
+    tags = record.get("tags")
+    if isinstance(tags, dict):
+        value = tags.get("handoverfrom")
+        if isinstance(value, str) and value:
+            return value
+    parent = record.get("parent_conversation_id")
+    return parent if isinstance(parent, str) and parent else None
 
 
 def durable_files(root: Path) -> list[Path]:
