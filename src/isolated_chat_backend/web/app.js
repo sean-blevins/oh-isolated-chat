@@ -553,8 +553,76 @@ async function startSeeded() {
   );
 }
 
-async function clearDurable() {
-  if (
+// Background spawns: the backend holds the Agent Server credentials (read from
+// its deployment spawner.json), so it can create a campaign root -- and the
+// workers its agent spawns -- directly. Unlike every other Agent Server call on
+// this page, a spawn does not need the page open.
+let spawnerReady = false;
+
+async function loadSpawner() {
+  const note = $("spawner-note");
+  const button = $("new-campaign");
+  try {
+    const response = await fetch("api/spawner");
+    const info = await response.json();
+    spawnerReady = Boolean(info.enabled);
+    button.disabled = !spawnerReady;
+    if (!spawnerReady) {
+      note.textContent = info.config_path
+        ? `Off: create ${info.config_path}`
+        : "Off: no spawner.json in the backend data dir";
+      return;
+    }
+    note.textContent =
+      `Workers spawn at ${info.spawn_path} (${info.public_base_url}); `
+      + "a container reaches that host directly.";
+  } catch (error) {
+    spawnerReady = false;
+    button.disabled = true;
+    note.textContent = `unavailable: ${error instanceof Error ? error.message : String(error)}`;
+  }
+}
+
+async function startCampaign() {
+  const task = $("campaign-message").value.trim();
+  if (!task) {
+    $("status").textContent = "Enter a campaign goal.";
+    return;
+  }
+  $("status").textContent = "creating campaign…";
+  let body;
+  let ok = false;
+  try {
+    const response = await fetch("api/campaign", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ task }),
+    });
+    body = await response.json();
+    ok = response.ok;
+  } catch (error) {
+    $("status").textContent =
+      `campaign failed: ${error instanceof Error ? error.message : String(error)}`;
+    return;
+  }
+  if (!ok) {
+    $("status").textContent = body.error ?? "campaign failed";
+    return;
+  }
+  $("status").textContent =
+    `campaign ${short(body.conversation_id)} started on ${body.agent_profile_name} — opening it`;
+  $("campaign-message").value = "";
+  window.parent.postMessage(
+    {
+      source: CHANNEL,
+      type: "navigate",
+      path: `/conversations/${dashed(body.conversation_id)}`,
+    },
+    "*",
+  );
+}
+
+async function clearDurable() {  if (
     !window.confirm(
       "Delete every promoted memory line from the durable store? Conversations keep their own " +
         "copies, so promoting again restores what they still carry.",
@@ -579,9 +647,11 @@ $("promote-all").addEventListener("click", () => promote("all"));
 $("clear-durable").addEventListener("click", () => clearDurable());
 $("new-seeded").addEventListener("click", startSeeded);
 $("new-agent-profile").addEventListener("change", syncLlmSelect);
+$("new-campaign").addEventListener("click", startCampaign);
 $("auto-handover").addEventListener("change", refresh);
 (async () => {
   await loadProfiles();
   await loadAgentProfiles();
+  await loadSpawner();
   await refresh();
 })();

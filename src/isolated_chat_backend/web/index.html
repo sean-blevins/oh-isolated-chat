@@ -46,6 +46,19 @@
   Auto-hand-over when the hook requests one (confirms with the model first)</label>
 </div>
 
+<h2>Background orchestrator</h2>
+<div class="bar">
+  <input id="campaign-message" type="text" size="40" placeholder="Campaign goal…">
+  <button id="new-campaign" class="primary">Start campaign</button>
+  <span class="note" id="spawner-note"></span>
+</div>
+<p class="note">
+  A campaign is a root orchestrator conversation whose agent can start worker
+  conversations on its own, in the background, with no page open. It needs a
+  <code>spawner.json</code> giving this backend the Agent Server URL and session
+  key; without one the button is disabled and the note says where to put it.
+</p>
+
 <h2>Conversations</h2>
 <table>
   <thead>

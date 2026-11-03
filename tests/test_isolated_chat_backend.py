@@ -17,6 +17,7 @@ from isolated_chat_backend import (  # noqa: E402
     memory,
     persistence,
     profiles,
+    spawner,
     state,
 )
 
@@ -604,6 +605,258 @@ def test_parse_verdict_ignores_prose_and_needs_a_bool() -> None:
     }
     assert handover._parse_verdict('{"reason": "no bool"}') is None
     assert handover._parse_verdict("not json at all") is None
+
+
+# ----- spawner --------------------------------------------------------------
+
+
+class FakeClient:
+    """Stand-in for AgentServerClient: records what the app would send/save."""
+
+    def __init__(self, created=None, profiles=None, profile_id="profile-new"):
+        self.created = created or {"id": "99998888-7777-6666-5555-444433332222"}
+        self.profiles = profiles or []
+        self.profile_id = profile_id
+        self.saved = {}
+        self.conversation_payloads = []
+
+    def list_agent_profiles(self):
+        return {"profiles": self.profiles, "active_agent_profile_id": None}
+
+    def get_agent_profile(self, name):
+        return {"profile": {**self.saved.get(name, {}), "id": self.profile_id}}
+
+    def save_agent_profile(self, name, profile):
+        self.saved[name] = profile
+        return {"name": name}
+
+    def create_conversation(self, payload):
+        self.conversation_payloads.append(payload)
+        return self.created
+
+
+def spawner_config(**overrides) -> spawner.SpawnerConfig:
+    base = {
+        "agent_server_url": "http://127.0.0.1:18000",
+        "session_key": "key",
+        "listen_port": 59777,
+        "agent_profile_id": "base-profile",
+    }
+    base.update(overrides)
+    return spawner.config_from_dict(base)
+
+
+def test_spawner_config_defaults_public_base_url_to_the_docker_gateway() -> None:
+    config = spawner_config()
+    assert config.base_url == "http://host.docker.internal:59777"
+    assert config.spawn_url("aa11bb22cc33dd44") == (
+        "http://host.docker.internal:59777/api/spawn?campaign=aa11bb22cc33dd44"
+    )
+
+
+def test_spawner_config_prefers_an_explicit_public_base_url() -> None:
+    config = spawner_config(public_base_url="https://apps.example/lit")
+    assert config.spawn_url("aa") == (
+        "https://apps.example/lit/api/spawn?campaign=aa"
+    )
+
+
+def test_spawner_config_requires_a_url_and_a_key() -> None:
+    for missing in ("agent_server_url", "session_key"):
+        data = {
+            "agent_server_url": "http://x",
+            "session_key": "k",
+            "listen_port": 1,
+        }
+        data.pop(missing)
+        try:
+            spawner.config_from_dict(data)
+        except spawner.SpawnerConfigError:
+            continue
+        raise AssertionError(f"expected SpawnerConfigError when {missing} is absent")
+
+
+def test_load_spawner_config_reads_the_data_dir_and_a_key_file() -> None:
+    with tempfile.TemporaryDirectory() as tmp:
+        data_dir = Path(tmp)
+        key_file = data_dir / "api-key.txt"
+        key_file.write_text("secret-key\n")
+        (data_dir / "spawner.json").write_text(
+            json.dumps(
+                {
+                    "agent_server_url": "http://127.0.0.1:18000",
+                    "session_key_path": str(key_file),
+                    "agent_profile_id": "base",
+                }
+            )
+        )
+        config = spawner.load_spawner_config(data_dir)
+        assert config is not None
+        assert config.session_key == "secret-key"
+        assert config.agent_profile_id == "base"
+
+
+def test_load_spawner_config_is_none_when_absent() -> None:
+    with tempfile.TemporaryDirectory() as tmp:
+        assert spawner.load_spawner_config(Path(tmp)) is None
+
+
+def test_config_path_honours_an_explicit_override() -> None:
+    env = {spawner.CONFIG_ENV: "/etc/oh-isolated-chat/spawner.json"}
+    assert spawner.config_path(Path("/data"), env) == Path(
+        "/etc/oh-isolated-chat/spawner.json"
+    )
+
+
+def test_worker_payload_is_top_level_and_tagged_for_the_campaign() -> None:
+    config = spawner_config(llm_profile_ref="deepseek")
+    payload = spawner.build_worker_payload(
+        config,
+        "11112222-3333-4444-5555-666677778888",
+        "aa11bb22cc33dd44",
+        "Port the login form",
+        "Login form",
+    )
+    # Top-level: no native parent, the chain travels as tags only.
+    assert "parent_conversation_id" not in payload
+    assert payload["tags"] == {
+        "role": "worker",
+        "spawnedby": "aa11bb22cc33dd44",
+        "campaign": "aa11bb22cc33dd44",
+    }
+    assert payload["agent_profile_id"] == "base-profile"
+    assert payload["agent_launch_additions"] == {"llm_profile_ref": "deepseek"}
+    # The task is the worker's first message, so the create starts it running.
+    assert payload["initial_message"]["content"][0]["text"] == "Port the login form"
+    assert payload["title"] == "Login form"
+
+
+def test_spawn_worker_seeds_before_creating_and_shapes_the_tool_reply() -> None:
+    with tempfile.TemporaryDirectory() as tmp:
+        root = make_tree(Path(tmp))
+        config = spawner_config()
+        client = FakeClient()
+        seeded: list[str] = []
+
+        result = spawner.spawn_worker(
+            config,
+            root,
+            "aa11bb22cc33dd44",
+            "Do the thing",
+            "Thing",
+            "shared",
+            client,
+            reserve=lambda: "11112222-3333-4444-5555-666677778888",
+            seed=lambda r, hex_id: seeded.append(hex_id),
+        )
+
+        # Seeded for the reserved id before the create call.
+        assert seeded == ["11112222333344445555666677778888"]
+        assert len(client.conversation_payloads) == 1
+        # The reply matches StartChildConversationResponse: the campaign is echoed
+        # as the logical parent, along with the child's own id and the isolation.
+        assert result == {
+            "conversation_id": "99998888-7777-6666-5555-444433332222",
+            "parent_conversation_id": "aa11bb22cc33dd44",
+            "status": "idle",
+            "title": "Thing",
+            "url": None,
+            "workspace": None,
+            "isolation": "shared",
+        }
+
+
+def test_normalize_isolation_only_accepts_the_two_literals() -> None:
+    assert spawner.normalize_isolation("shared") == "shared"
+    assert spawner.normalize_isolation("worktree") == "worktree"
+    assert spawner.normalize_isolation("bogus") == "worktree"
+    assert spawner.normalize_isolation(None) == "worktree"
+
+
+def test_parse_spawn_request_reads_the_campaign_token_and_validates_task() -> None:
+    campaign, task, title, isolation = spawner.parse_spawn_request(
+        "/api/spawn?campaign=aa11bb22cc33dd44",
+        {"task": "Do it", "title": "T", "isolation": "shared"},
+    )
+    assert campaign == "aa11bb22cc33dd44"
+    assert (task, title, isolation) == ("Do it", "T", "shared")
+
+    for body in (None, {}, {"task": "   "}):
+        try:
+            spawner.parse_spawn_request("/api/spawn?campaign=x", body)
+        except ValueError:
+            continue
+        raise AssertionError(f"expected ValueError for body {body!r}")
+
+
+def test_orchestrator_profile_binds_the_spawn_tool_to_the_campaign_url() -> None:
+    profile = spawner.orchestrator_profile(
+        "orchestrator-abc", "deepseek", "http://host.docker.internal:59777/api/spawn?campaign=x"
+    )
+    spawn_tool = next(
+        tool for tool in profile["tools"] if tool["name"] == "start_child_conversation"
+    )
+    assert spawn_tool["params"]["launch_url"] == (
+        "http://host.docker.internal:59777/api/spawn?campaign=x"
+    )
+    # The default set (None) cannot be extended, so the profile names it.
+    names = {tool["name"] for tool in profile["tools"]}
+    assert {"terminal", "file_editor", "task_tracker"} <= names
+    assert profile["llm_profile_ref"] == "deepseek"
+    assert profile["agent_kind"] == "openhands"
+
+
+def test_resolve_llm_profile_ref_prefers_config_then_the_base_profile() -> None:
+    client = FakeClient(
+        profiles=[{"id": "base-profile", "llm_profile_ref": "from-base"}]
+    )
+    assert spawner.resolve_llm_profile_ref(client, spawner_config()) == "from-base"
+    assert (
+        spawner.resolve_llm_profile_ref(
+            client, spawner_config(llm_profile_ref="configured")
+        )
+        == "configured"
+    )
+
+
+def test_create_campaign_saves_a_profile_and_starts_a_tagged_root() -> None:
+    with tempfile.TemporaryDirectory() as tmp:
+        root = make_tree(Path(tmp))
+        client = FakeClient(
+            profiles=[{"id": "base-profile", "llm_profile_ref": "from-base"}]
+        )
+        seeded: list[str] = []
+
+        result = spawner.create_campaign(
+            spawner_config(),
+            root,
+            "Port the feature",
+            "Feature",
+            client,
+            reserve=lambda: "11112222-3333-4444-5555-666677778888",
+            seed=lambda r, hex_id: seeded.append(hex_id),
+        )
+
+        name = result["agent_profile_name"]
+        assert name == "orchestrator-111122223333"
+        saved = client.saved[name]
+        spawn_tool = next(
+            tool
+            for tool in saved["tools"]
+            if tool["name"] == "start_child_conversation"
+        )
+        assert "campaign=11112222333344445555666677778888" in spawn_tool["params"][
+            "launch_url"
+        ]
+        assert seeded == ["11112222333344445555666677778888"]
+        payload = client.conversation_payloads[-1]
+        assert payload["agent_profile_id"] == "profile-new"
+        assert payload["tags"] == {
+            "role": "orchestrator",
+            "campaign": "11112222333344445555666677778888",
+        }
+        assert result["conversation_id"] == client.created["id"]
+        assert result["spawn_url"].endswith("campaign=11112222333344445555666677778888")
 
 
 def main() -> int:
