@@ -12,18 +12,17 @@ from inside a conversation container at ``host.docker.internal:<port>`` -- that
 creates a **top-level** worker conversation through the Agent Server, so the
 worker is Canvas-openable and the spawn needs no browser page open.
 
-Two things make a spawn work end to end:
+The backend is launched by the Agent Server but inherits none of its ``OH_*``
+environment, so by default it cannot call the Agent Server. Rather than make the
+operator hand-write a config file, this module **discovers** what it needs from
+the parent process (``/proc/<ppid>/environ`` and cmdline) -- the Agent Server's
+session key and listen port -- and falls back to the on-disk session key under
+``<persistence>/agent-canvas/api-key.txt``. A ``spawner.json`` is only needed to
+override an exotic deployment (a custom public base URL, a fixed port).
 
-* **The Agent Server client.** The backend is a child of the Agent Server, but it
-  inherits none of its ``OH_*`` environment. Option 1 of the deployment design is
-  to hand it the base URL and session key explicitly in ``spawner.json``, so it
-  can call the Agent Server directly. That is the difference between a spawn that
-  runs entirely in the background and one that queues until a page is mounted.
-* **Parent identity.** The tool's request body carries no parent id (the parent
-  only ever appeared in the default URL's path). So the launch URL is minted
-  *per campaign* with the campaign id as a query token, and this endpoint reads
-  it back. A campaign is a root orchestrator conversation; the URL is baked into
-  that campaign's dedicated agent profile, created here.
+Because the request body carries no parent id, the campaign travels in the
+launch URL as a query token. The worker's own agent profile -- chosen in the UI
+per campaign -- rides the URL too, so the endpoint stays stateless.
 
 Everything is stdlib-only and injectable (``client`` / ``reserve`` / ``seed``) so
 the wire contract is tested without a network or a running Agent Server.
@@ -38,7 +37,7 @@ import urllib.request
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Callable
-from urllib.parse import parse_qs, urlparse
+from urllib.parse import parse_qs, urlencode, urlparse
 from uuid import UUID, uuid4
 
 from . import hooks
@@ -53,6 +52,12 @@ ROLE_TAG_KEY = "role"
 PARENT_TAG_KEY = "spawnedby"
 CAMPAIGN_TAG_KEY = "campaign"
 
+# Launch-URL query keys. The request body has no parent and the URL is the only
+# per-campaign channel, so everything the endpoint needs travels here.
+CAMPAIGN_QUERY_KEY = CAMPAIGN_TAG_KEY
+PROFILE_QUERY_KEY = "profile"
+LLM_QUERY_KEY = "llm"
+
 # The tools an orchestrator agent profile gets, besides the spawn tool. The
 # default OpenHands set (`tools: null`) cannot be extended, so the profile names
 # the set it wants explicitly.
@@ -63,9 +68,14 @@ DEFAULT_LISTEN_HOST = "0.0.0.0"
 DEFAULT_LISTEN_PORT = 59777
 DEFAULT_ORCHESTRATOR_PREFIX = "orchestrator"
 DEFAULT_REQUEST_TIMEOUT = 60.0
+DEFAULT_AGENT_SERVER_URL = "http://127.0.0.1:8000"
 
 CONFIG_NAME = "spawner.json"
 CONFIG_ENV = "OH_ISOLATED_CHAT_SPAWNER_CONFIG"
+
+# The on-disk session key, beside the persistence root, if the process walk
+# cannot reach the Agent Server's environment.
+SESSION_KEY_REL = Path("agent-canvas") / "api-key.txt"
 
 
 class SpawnerConfigError(ValueError):
@@ -89,20 +99,22 @@ def _dashed(value: str) -> str:
 
 @dataclass(frozen=True)
 class SpawnerConfig:
-    """The deployment-provided knobs for background spawns.
+    """The knobs for background spawns. Every field has a working default.
 
-    ``agent_server_url`` and one of ``session_key`` / ``session_key_path`` are
-    how the backend reaches the Agent Server. ``public_base_url`` is how the
-    *container* reaches this endpoint; it defaults to the Docker host gateway,
-    which the runtime already adds a host entry for.
+    ``agent_server_url`` and ``session_key`` are normally discovered from the
+    Agent Server process. ``public_base_url`` is how the *container* reaches this
+    endpoint; it defaults to the Docker host gateway, which the runtime already
+    adds a host entry for.
     """
 
-    agent_server_url: str
-    session_key: str
+    agent_server_url: str = DEFAULT_AGENT_SERVER_URL
+    session_key: str = ""
     listen_host: str = DEFAULT_LISTEN_HOST
     listen_port: int = DEFAULT_LISTEN_PORT
     public_base_url: str = ""
     spawn_path: str = DEFAULT_SPAWN_PATH
+    # Optional deployment defaults; a campaign normally supplies its own via the
+    # UI, so these exist only for a headless/scripted caller.
     agent_profile_id: str = ""
     llm_profile_ref: str | None = None
     orchestrator_name_prefix: str = DEFAULT_ORCHESTRATOR_PREFIX
@@ -116,31 +128,182 @@ class SpawnerConfig:
             return self.public_base_url.rstrip("/")
         return f"http://host.docker.internal:{self.listen_port}"
 
-    def spawn_url(self, campaign_id: str) -> str:
+    def spawn_url(
+        self,
+        campaign_id: str,
+        agent_profile_id: str | None = None,
+        llm_profile_ref: str | None = None,
+    ) -> str:
         """The per-campaign launch URL baked into its orchestrator profile."""
-        return f"{self.base_url}{self.spawn_path}?{CAMPAIGN_TAG_KEY}={_hex(campaign_id)}"
+        query = {CAMPAIGN_QUERY_KEY: _hex(campaign_id)}
+        if agent_profile_id:
+            query[PROFILE_QUERY_KEY] = agent_profile_id
+        if llm_profile_ref:
+            query[LLM_QUERY_KEY] = llm_profile_ref
+        return f"{self.base_url}{self.spawn_path}?{urlencode(query)}"
 
 
-def _read_session_key(data: dict) -> str:
-    inline = data.get("session_key")
-    if isinstance(inline, str) and inline.strip():
-        return inline.strip()
-    path = data.get("session_key_path")
-    if isinstance(path, str) and path.strip():
+# --- discovery --------------------------------------------------------------
+#
+# The backend is a child of the Agent Server, so the Agent Server's environment
+# and argv are readable at ``/proc/<pid>/``. That is where the session key and
+# the listen port come from, with no config file. This is Linux-only by design
+# (the deployment is); a non-Linux host still works via ``spawner.json``.
+
+
+def _read_proc_environ(pid: int) -> dict[str, str]:
+    try:
+        raw = Path(f"/proc/{pid}/environ").read_bytes()
+    except OSError:
+        return {}
+    env: dict[str, str] = {}
+    for entry in raw.split(b"\0"):
+        if b"=" in entry:
+            key, value = entry.split(b"=", 1)
+            env[key.decode(errors="replace")] = value.decode(errors="replace")
+    return env
+
+
+def _read_proc_cmdline(pid: int) -> list[str]:
+    try:
+        raw = Path(f"/proc/{pid}/cmdline").read_bytes()
+    except OSError:
+        return []
+    return [part.decode(errors="replace") for part in raw.split(b"\0") if part]
+
+
+def _parent_pid(pid: int) -> int:
+    """The parent pid from ``/proc/<pid>/stat``, robust to a comm with spaces."""
+    try:
+        stat = Path(f"/proc/{pid}/stat").read_text()
+    except OSError:
+        return 0
+    head, _, rest = stat.rpartition(")")
+    if not rest:
+        return 0
+    fields = rest.split()
+    try:
+        return int(fields[1])  # state is fields[0], ppid is fields[1]
+    except (IndexError, ValueError):
+        return 0
+
+
+def _ancestors(limit: int = 8):
+    pid = os.getpid()
+    for _ in range(limit):
+        pid = _parent_pid(pid)
+        if pid <= 1:
+            return
+        yield pid
+
+
+def _normalize_host(host: str) -> str:
+    host = host.strip().strip("[]")
+    if host in {"", "0.0.0.0", "::", "*"}:
+        return "127.0.0.1"
+    return host
+
+
+def _origin(url: str | None) -> str | None:
+    """The scheme://host:port of a URL, or None."""
+    if not isinstance(url, str) or not url.strip():
+        return None
+    parsed = urlparse(url if "://" in url else f"//{url}")
+    if not parsed.hostname:
+        return None
+    port = f":{parsed.port}" if parsed.port else ""
+    return f"{parsed.scheme or 'http'}://{parsed.hostname}{port}"
+
+
+def _agent_server_from_cmdline(cmdline: list[str]) -> str | None:
+    """The Agent Server base URL, parsed from its ``--host``/``--port`` argv."""
+    host, port = None, None
+    for index, arg in enumerate(cmdline):
+        for flag in ("--host", "--port"):
+            value = None
+            if arg == flag and index + 1 < len(cmdline):
+                value = cmdline[index + 1]
+            elif arg.startswith(flag + "="):
+                value = arg[len(flag) + 1 :]
+            if value is None:
+                continue
+            if flag == "--host":
+                host = value
+            else:
+                port = value
+    if not port:
+        return None
+    return f"http://{_normalize_host(host or '127.0.0.1')}:{port}"
+
+
+def _session_key_from_env(env: dict[str, str]) -> str:
+    path = env.get("OH_SESSION_API_KEY_PATH")
+    if path:
         try:
-            return Path(path).expanduser().read_text().strip()
-        except OSError as exc:
-            raise SpawnerConfigError(f"cannot read session_key_path {path!r}: {exc}")
-    raise SpawnerConfigError("session_key or session_key_path is required")
+            key = Path(path).read_text().strip()
+        except OSError:
+            key = ""
+        if key:
+            return key
+    return env.get("OH_SESSION_API_KEYS_0", "").strip()
+
+
+def discover_persistence_environment() -> dict:
+    """What the Agent Server process advertises: base URL and session key.
+
+    The Agent Server is identified by *holding the session key* in its
+    environment, not merely by looking like a server. An intermediate process
+    (a shell that launched the backend) may carry a ``--port`` in its argv, and a
+    bare cmdline scan could mistake that for the Agent Server's port; requiring
+    the key avoids the whole class. Only if no ancestor holds a key do we accept
+    an ancestor advertising ``OH_APP_BACKEND_PUBLIC_URL`` for its URL alone.
+    """
+    url_only: str | None = None
+    for pid in _ancestors():
+        env = _read_proc_environ(pid)
+        key = _session_key_from_env(env)
+        if key:
+            url = _agent_server_from_cmdline(_read_proc_cmdline(pid)) or _origin(
+                env.get("OH_APP_BACKEND_PUBLIC_URL")
+            )
+            return {
+                "agent_server_url": url or DEFAULT_AGENT_SERVER_URL,
+                "session_key": key,
+            }
+        if url_only is None:
+            url_only = _origin(env.get("OH_APP_BACKEND_PUBLIC_URL"))
+    if url_only:
+        return {"agent_server_url": url_only, "session_key": ""}
+    return {}
+
+
+def discover(root: Path) -> dict:
+    """Discovered defaults, with the on-disk key as a fallback for the key."""
+    found = discover_persistence_environment()
+    found.setdefault("agent_server_url", DEFAULT_AGENT_SERVER_URL)
+    if not found.get("session_key"):
+        try:
+            key = (root / SESSION_KEY_REL).read_text().strip()
+        except OSError:
+            key = ""
+        if key:
+            found["session_key"] = key
+    return found
+
+
+# --- config -----------------------------------------------------------------
 
 
 def config_from_dict(data: object) -> SpawnerConfig:
-    """Validate a parsed ``spawner.json`` into a :class:`SpawnerConfig`."""
+    """Validate a merged config payload into a :class:`SpawnerConfig`."""
     if not isinstance(data, dict):
         raise SpawnerConfigError("spawner config must be a JSON object")
     url = data.get("agent_server_url")
     if not isinstance(url, str) or not url.strip():
         raise SpawnerConfigError("agent_server_url is required")
+    key = data.get("session_key")
+    if not isinstance(key, str) or not key.strip():
+        key = ""
     port = data.get("listen_port", DEFAULT_LISTEN_PORT)
     if not isinstance(port, int) or isinstance(port, bool):
         raise SpawnerConfigError("listen_port must be an integer")
@@ -151,7 +314,7 @@ def config_from_dict(data: object) -> SpawnerConfig:
         raise SpawnerConfigError("orchestrator_tools must be a list of tool names")
     return SpawnerConfig(
         agent_server_url=url.strip().rstrip("/"),
-        session_key=_read_session_key(data),
+        session_key=key.strip(),
         listen_host=str(data.get("listen_host") or DEFAULT_LISTEN_HOST),
         listen_port=port,
         public_base_url=str(data.get("public_base_url") or ""),
@@ -168,12 +331,18 @@ def config_from_dict(data: object) -> SpawnerConfig:
     )
 
 
-def config_path(data_dir: Path, env: dict | None = None) -> Path:
-    """Where the spawner config is looked for: ``<data-dir>/spawner.json``.
+def _read_session_key_file(path: str) -> str:
+    try:
+        return Path(path).expanduser().read_text().strip()
+    except OSError as exc:
+        raise SpawnerConfigError(f"cannot read session_key_path {path!r}: {exc}")
 
-    The managed backend is handed its data dir, which persists across artifact
-    re-prepares, so a config placed there survives an upgrade. An explicit
-    ``OH_ISOLATED_CHAT_SPAWNER_CONFIG`` overrides it for local runs.
+
+def config_path(data_dir: Path, env: dict | None = None) -> Path:
+    """Where an override config is looked for: ``<data-dir>/spawner.json``.
+
+    Not required: without it the config is discovered from the Agent Server
+    process. An explicit ``OH_ISOLATED_CHAT_SPAWNER_CONFIG`` overrides the path.
     """
     env = os.environ if env is None else env
     override = env.get(CONFIG_ENV)
@@ -182,21 +351,29 @@ def config_path(data_dir: Path, env: dict | None = None) -> Path:
     return data_dir / CONFIG_NAME
 
 
-def load_spawner_config(data_dir: Path, env: dict | None = None) -> SpawnerConfig | None:
-    """Load the deployment config, or ``None`` when none has been placed.
+def load_spawner_config(
+    data_dir: Path, root: Path, env: dict | None = None
+) -> SpawnerConfig | None:
+    """Resolve the config: discovery first, an optional file as an override.
 
-    Missing is the normal state (the app works without background spawns) and is
-    not an error; a present but malformed file raises :class:`SpawnerConfigError`
-    so the operator sees why the feature is off instead of a silent no-op.
+    Returns ``None`` when nothing usable can be found (no session key anywhere),
+    which disables background spawns without taking down the backend. A present
+    but malformed file raises :class:`SpawnerConfigError` so the operator sees
+    why.
     """
     path = config_path(data_dir, env)
-    if not path.is_file():
+    discovered = discover(root)
+    if path.is_file():
+        try:
+            data = json.loads(path.read_text())
+        except (OSError, ValueError) as exc:
+            raise SpawnerConfigError(f"cannot read {path}: {exc}")
+        if isinstance(data, dict) and data.get("session_key_path"):
+            data = {**data, "session_key": _read_session_key_file(data["session_key_path"])}
+        return config_from_dict({**discovered, **data})
+    if not discovered.get("session_key"):
         return None
-    try:
-        data = json.loads(path.read_text())
-    except (OSError, ValueError) as exc:
-        raise SpawnerConfigError(f"cannot read {path}: {exc}")
-    return config_from_dict(data)
+    return config_from_dict(discovered)
 
 
 # --- the Agent Server client -------------------------------------------------
@@ -247,6 +424,53 @@ class AgentServerClient:
         return self.request("POST", "/api/conversations", payload)
 
 
+def find_agent_profile(client: AgentServerClient, agent_profile_id: str) -> dict | None:
+    """The Agent Server's summary for a profile id, or None."""
+    try:
+        listing = client.list_agent_profiles()
+    except (urllib.error.URLError, OSError, ValueError):
+        return None
+    profiles = listing.get("profiles") if isinstance(listing, dict) else None
+    for profile in profiles if isinstance(profiles, list) else []:
+        if isinstance(profile, dict) and str(profile.get("id")) == str(agent_profile_id):
+            return profile
+    return None
+
+
+def resolve_llm_profile_ref(
+    client: AgentServerClient,
+    agent_profile_id: str,
+    llm_profile_ref: str | None,
+) -> str:
+    """The LLM profile an orchestrator runs on: the choice, else the base's own.
+
+    The Agent Server resolves credentials from *its* stores, so the app only ever
+    names a profile. A campaign normally passes the choice; for a headless caller
+    the base agent profile's own ``llm_profile_ref`` is reused, so the campaign
+    runs on the same model as the conversations the user already starts.
+    """
+    if llm_profile_ref:
+        return llm_profile_ref
+    chosen = find_agent_profile(client, agent_profile_id) if agent_profile_id else None
+    ref = chosen.get("llm_profile_ref") if isinstance(chosen, dict) else None
+    if isinstance(ref, str) and ref:
+        return ref
+    try:
+        listing = client.list_agent_profiles()
+    except (urllib.error.URLError, OSError, ValueError):
+        listing = {}
+    active = listing.get("active_agent_profile_id") if isinstance(listing, dict) else None
+    if active:
+        chosen = find_agent_profile(client, str(active))
+        ref = chosen.get("llm_profile_ref") if isinstance(chosen, dict) else None
+        if isinstance(ref, str) and ref:
+            return ref
+    raise SpawnerConfigError(
+        "no LLM profile: pick one for the campaign, or launch on an agent "
+        "profile that has one"
+    )
+
+
 # --- worker creation ---------------------------------------------------------
 
 
@@ -255,7 +479,9 @@ def build_worker_payload(
     conversation_id: str,
     campaign_id: str,
     task: str,
-    title: str | None = None,
+    title: str | None,
+    agent_profile_id: str,
+    llm_profile_ref: str | None,
 ) -> dict:
     """The ``POST /api/conversations`` body for a worker.
 
@@ -267,6 +493,7 @@ def build_worker_payload(
     campaign_hex = _hex(campaign_id)
     payload: dict = {
         "conversation_id": conversation_id,
+        "agent_profile_id": agent_profile_id,
         "initial_message": {
             "role": "user",
             "content": [{"type": "text", "text": task}],
@@ -277,10 +504,8 @@ def build_worker_payload(
             CAMPAIGN_TAG_KEY: campaign_hex,
         },
     }
-    if config.agent_profile_id:
-        payload["agent_profile_id"] = config.agent_profile_id
-    if config.llm_profile_ref:
-        payload["agent_launch_additions"] = {"llm_profile_ref": config.llm_profile_ref}
+    if llm_profile_ref:
+        payload["agent_launch_additions"] = {"llm_profile_ref": llm_profile_ref}
     if title:
         payload["title"] = title
     return payload
@@ -312,13 +537,50 @@ def normalize_isolation(value: object) -> str:
     return value if isinstance(value, str) and value in _ISOLATIONS else DEFAULT_ISOLATION
 
 
+@dataclass(frozen=True)
+class SpawnRequest:
+    """A validated spawn POST: the tool's fields plus the URL's campaign token."""
+
+    campaign_id: str | None
+    task: str
+    title: str | None
+    isolation: str
+    agent_profile_id: str | None
+    llm_profile_ref: str | None
+
+
+def parse_spawn_request(path: str, body: object) -> SpawnRequest:
+    """Validate a spawn POST into a :class:`SpawnRequest`.
+
+    ``campaign_id`` and the worker's agent profile come from the URL query (the
+    request body carries neither); ``task`` is required by the tool's contract.
+    Raises ``ValueError`` with a message suitable for a ``detail`` field.
+    """
+    query = parse_qs(urlparse(path).query)
+    campaign = (query.get(CAMPAIGN_QUERY_KEY) or [None])[0]
+    profile = (query.get(PROFILE_QUERY_KEY) or [None])[0]
+    llm = (query.get(LLM_QUERY_KEY) or [None])[0]
+    if not isinstance(body, dict):
+        raise ValueError("request body must be a JSON object")
+    task = body.get("task")
+    if not isinstance(task, str) or not task.strip():
+        raise ValueError("task is required")
+    title = body.get("title")
+    title = title if isinstance(title, str) and title.strip() else None
+    return SpawnRequest(
+        campaign_id=campaign or None,
+        task=task,
+        title=title,
+        isolation=normalize_isolation(body.get("isolation")),
+        agent_profile_id=profile or None,
+        llm_profile_ref=llm or None,
+    )
+
+
 def spawn_worker(
     config: SpawnerConfig,
     root: Path,
-    campaign_id: str,
-    task: str,
-    title: str | None,
-    isolation: object,
+    request: SpawnRequest,
     client: AgentServerClient,
     reserve: Callable[[], str] = lambda: str(uuid4()),
     seed: Callable[[Path, str], Path] = hooks.seed,
@@ -330,12 +592,26 @@ def spawn_worker(
     plugin afterwards would miss the container's first run (the same ordering the
     app's own seeded start uses).
     """
+    if not request.campaign_id:
+        raise SpawnerConfigError("missing campaign token in the launch URL")
+    agent_profile_id = request.agent_profile_id or config.agent_profile_id
+    if not agent_profile_id:
+        raise SpawnerConfigError("missing agent profile for the worker")
+    llm_profile_ref = request.llm_profile_ref or config.llm_profile_ref
     conversation_id = reserve()
     seed(root, _hex(conversation_id))
-    payload = build_worker_payload(config, conversation_id, campaign_id, task, title)
+    payload = build_worker_payload(
+        config,
+        conversation_id,
+        request.campaign_id,
+        request.task,
+        request.title,
+        agent_profile_id,
+        llm_profile_ref,
+    )
     created = client.create_conversation(payload)
     return build_spawn_response(
-        created, conversation_id, campaign_id, normalize_isolation(isolation), title
+        created, conversation_id, request.campaign_id, request.isolation, request.title
     )
 
 
@@ -355,41 +631,9 @@ def orchestrator_profile(name: str, llm_profile_ref: str, spawn_url: str) -> dic
         "llm_profile_ref": llm_profile_ref,
         "tools": [
             *({"name": tool} for tool in DEFAULT_ORCHESTRATOR_TOOLS),
-            {
-                "name": "start_child_conversation",
-                "params": {"launch_url": spawn_url},
-            },
+            {"name": "start_child_conversation", "params": {"launch_url": spawn_url}},
         ],
     }
-
-
-def resolve_llm_profile_ref(client: AgentServerClient, config: SpawnerConfig) -> str:
-    """An LLM profile for the orchestrator, from config or the base profile.
-
-    The Agent Server resolves credentials from *its* stores, so the app only ever
-    names a profile. Config wins; otherwise the base agent profile's own
-    ``llm_profile_ref`` is reused, so a campaign runs on the same model as the
-    conversations the user already starts.
-    """
-    if config.llm_profile_ref:
-        return config.llm_profile_ref
-    try:
-        listing = client.list_agent_profiles()
-    except (urllib.error.URLError, OSError, ValueError):
-        listing = {}
-    profiles = listing.get("profiles") if isinstance(listing, dict) else None
-    profiles = profiles if isinstance(profiles, list) else []
-    by_id = {str(p.get("id")): p for p in profiles if isinstance(p, dict)}
-    chosen = by_id.get(config.agent_profile_id)
-    if chosen is None and listing.get("active_agent_profile_id"):
-        chosen = by_id.get(str(listing["active_agent_profile_id"]))
-    ref = chosen.get("llm_profile_ref") if isinstance(chosen, dict) else None
-    if isinstance(ref, str) and ref:
-        return ref
-    raise SpawnerConfigError(
-        "no llm_profile_ref: set one in spawner.json or launch on an agent "
-        "profile that has one"
-    )
 
 
 def build_campaign_payload(
@@ -410,8 +654,6 @@ def build_campaign_payload(
         },
         "tags": {ROLE_TAG_KEY: "orchestrator", CAMPAIGN_TAG_KEY: hex_id},
     }
-    if config.llm_profile_ref:
-        payload["agent_launch_additions"] = {"llm_profile_ref": config.llm_profile_ref}
     if title:
         payload["title"] = title
     return payload
@@ -422,23 +664,31 @@ def create_campaign(
     root: Path,
     task: str,
     title: str | None,
+    agent_profile_id: str,
+    llm_profile_ref: str | None,
     client: AgentServerClient,
     reserve: Callable[[], str] = lambda: str(uuid4()),
     seed: Callable[[Path, str], Path] = hooks.seed,
 ) -> dict:
     """Create a campaign root: a dedicated orchestrator profile + its conversation.
 
-    The profile is what supplies the campaign's spawn URL and the
-    ``start_child_conversation`` tool, so the root's agent can spawn workers with
-    no page involved. The conversation is top-level (Canvas-openable), tagged
-    ``role=orchestrator`` and ``campaign=<self>``.
+    The profile is what supplies the campaign's spawn URL (including the worker's
+    chosen agent profile and any LLM override) and the ``start_child_conversation``
+    tool, so the root's agent can spawn workers with no page involved. The
+    conversation is top-level (Canvas-openable), tagged ``role=orchestrator`` and
+    ``campaign=<self>``.
     """
+    chosen = find_agent_profile(client, agent_profile_id) if agent_profile_id else None
+    if isinstance(chosen, dict) and chosen.get("agent_kind") == "acp":
+        raise SpawnerConfigError(
+            "an ACP agent profile cannot host the spawn tool; pick an OpenHands profile"
+        )
     conversation_id = reserve()
     hex_id = _hex(conversation_id)
     name = f"{config.orchestrator_name_prefix}-{hex_id[:12]}"
-    url = config.spawn_url(conversation_id)
-    llm_ref = resolve_llm_profile_ref(client, config)
-    client.save_agent_profile(name, orchestrator_profile(name, llm_ref, url))
+    orchestrator_llm = resolve_llm_profile_ref(client, agent_profile_id, llm_profile_ref)
+    url = config.spawn_url(conversation_id, agent_profile_id, orchestrator_llm)
+    client.save_agent_profile(name, orchestrator_profile(name, orchestrator_llm, url))
     profile = client.get_agent_profile(name)
     profile_id = str(profile.get("profile", {}).get("id") or "")
     if not profile_id:
@@ -451,29 +701,8 @@ def create_campaign(
         "conversation_id": str(created.get("id") or conversation_id),
         "agent_profile_id": profile_id,
         "agent_profile_name": name,
+        "worker_agent_profile_id": agent_profile_id,
         "spawn_url": url,
         "status": str(created.get("execution_status") or "idle"),
         "title": title,
     }
-
-
-# --- the request shape the tool sends ----------------------------------------
-
-
-def parse_spawn_request(path: str, body: object) -> tuple[str | None, str, str | None, str]:
-    """Validate a spawn POST into ``(campaign_id, task, title, isolation)``.
-
-    ``campaign_id`` comes from the URL query token (the request body carries no
-    parent id); ``task`` is required by the tool's contract. Raises ``ValueError``
-    with a message suitable for a ``detail`` field.
-    """
-    query = parse_qs(urlparse(path).query)
-    campaign = (query.get(CAMPAIGN_TAG_KEY) or [None])[0]
-    if not isinstance(body, dict):
-        raise ValueError("request body must be a JSON object")
-    task = body.get("task")
-    if not isinstance(task, str) or not task.strip():
-        raise ValueError("task is required")
-    title = body.get("title")
-    title = title if isinstance(title, str) and title.strip() else None
-    return campaign, task, title, normalize_isolation(body.get("isolation"))

@@ -14,7 +14,8 @@ Routes:
   GET  /, /app.css, /app.js   the browser view served from ``web/``
 
 A second listener (:class:`SpawnHandler`) serves the container-reachable spawn
-route when ``spawner.json`` is present; see ``spawner.py``.
+route; its configuration is discovered from the Agent Server by default, with an
+optional ``spawner.json`` override -- see ``spawner.py``.
 
 Relative asset URLs in the view resolve against the bridge's ingress mount, so
 the page and its assets stay inside the authenticated path.
@@ -52,11 +53,14 @@ class Handler(BaseHTTPRequestHandler):
     server_version = "oh-isolated-chat/0.1"
     root: Path
     web_dir: Path = WEB_DIR
-    # Set by ``__main__`` when ``spawner.json`` is present; ``None`` disables
+    # Set by ``__main__`` when background spawns are available; ``None`` disables
     # every background-spawn route (they answer 503 rather than pretend).
     spawner_config: SpawnerConfig | None = None
     agent_client: AgentServerClient | None = None
     spawner_config_path: str = ""
+    # Where the config came from: ``discovered`` (Agent Server process walk /
+    # on-disk key) or ``file`` (an explicit ``spawner.json`` override).
+    spawner_source: str = "none"
 
     def log_message(self, fmt: str, *args: object) -> None:
         sys.stderr.write("[oh-isolated-chat] %s\n" % (fmt % args))
@@ -224,6 +228,7 @@ class Handler(BaseHTTPRequestHandler):
             200,
             {
                 "enabled": config is not None,
+                "source": self.spawner_source,
                 "config_path": self.spawner_config_path,
                 "public_base_url": config.base_url if config else None,
                 "spawn_path": config.spawn_path if config else None,
@@ -242,6 +247,10 @@ class Handler(BaseHTTPRequestHandler):
         background. Only the backend can create it, because only the backend
         holds the Agent Server credentials (the page would need a request per
         step, and a spawn must not depend on the page being open).
+
+        The caller chooses the base agent profile -- and optionally the LLM
+        profile -- per campaign, so the workers it spawns inherit that choice
+        through the URL baked into the orchestrator profile.
         """
         if self.spawner_config is None or self.agent_client is None:
             return self._json(
@@ -259,9 +268,24 @@ class Handler(BaseHTTPRequestHandler):
             return self._json(400, {"error": "task is required"})
         title = payload.get("title")
         title = title if isinstance(title, str) and title.strip() else None
+        agent_profile_id = payload.get("agent_profile_id")
+        if not isinstance(agent_profile_id, str) or not agent_profile_id.strip():
+            return self._json(400, {"error": "agent_profile_id is required"})
+        llm_profile_ref = payload.get("llm_profile_ref")
+        llm_profile_ref = (
+            llm_profile_ref
+            if isinstance(llm_profile_ref, str) and llm_profile_ref.strip()
+            else None
+        )
         try:
             result = spawner.create_campaign(
-                self.spawner_config, self.root, task, title, self.agent_client
+                self.spawner_config,
+                self.root,
+                task,
+                title,
+                agent_profile_id,
+                llm_profile_ref,
+                self.agent_client,
             )
         except urllib.error.HTTPError as exc:
             return self._json(502, {"error": f"Agent Server rejected: {exc}"})
@@ -292,18 +316,12 @@ class SpawnHandler(Handler):
             return self._json(404, {"detail": "not found"})
         body = self._payload()
         try:
-            campaign, task, title, isolation = spawner.parse_spawn_request(
-                self.path, body
-            )
+            request = spawner.parse_spawn_request(self.path, body)
         except ValueError as exc:
             return self._json(400, {"detail": str(exc)})
-        if not campaign:
-            return self._json(
-                400, {"detail": "missing campaign token in the launch URL"}
-            )
         try:
             result = spawner.spawn_worker(
-                config, self.root, campaign, task, title, isolation, self.agent_client
+                config, self.root, request, self.agent_client
             )
         except urllib.error.HTTPError as exc:
             return self._json(502, {"detail": f"Agent Server rejected: {exc}"})

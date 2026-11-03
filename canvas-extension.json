@@ -21,7 +21,7 @@
     "artifacts": {
       "linux-amd64": {
         "path": "backend/linux-amd64.tar.gz",
-        "sha256": "845c06672922037337eb5be16bfffa3d0408f9e0e110a358d2ca007f76c2368f"
+        "sha256": "5d8bc147c62e766eb0a4e7a15ca32d42b971950f3e7b6675efbf8964bcc184e3"
       }
     },
     "argv": [

@@ -309,29 +309,43 @@ async function loadAgentProfiles() {
   agentProfiles = Array.isArray(profiles) ? profiles : [];
   activeAgentProfileId = result.data?.active_agent_profile_id ?? null;
 
-  const select = $("new-agent-profile");
+  // A new conversation can launch on any profile; a campaign must be OpenHands
+  // (its orchestrator profile adds the spawn tool, which an ACP profile cannot
+  // host), so that select hides ACP profiles.
+  populateAgentSelect("new-agent-profile");
+  populateAgentSelect("campaign-agent-profile", { openHandsOnly: true });
+  syncLlmSelect("new");
+  syncLlmSelect("campaign");
+}
+
+// Fill an agent-profile select from the host's list. `openHandsOnly` drops ACP
+// profiles, which cannot host the orchestrator's spawn tool.
+function populateAgentSelect(selectId, { openHandsOnly = false } = {}) {
+  const select = $(selectId);
   select.replaceChildren();
   for (const profile of agentProfiles) {
+    if (openHandsOnly && profile.agent_kind === "acp") continue;
     const option = document.createElement("option");
     option.value = profile.id;
     option.textContent = profile.name;
     option.title = `${profile.name} · ${profile.agent_kind}`;
     select.append(option);
   }
-  if (activeAgentProfileId) {
+  const active = agentProfiles.find((profile) => profile.id === activeAgentProfileId);
+  if (active && (!openHandsOnly || active.agent_kind !== "acp")) {
     select.value = activeAgentProfileId;
   }
-  syncLlmSelect();
 }
 
 // The LLM dropdown lists every saved LLM profile; the chosen one overrides the
 // agent profile's own `llm_profile_ref` for that launch (the Agent Server
 // records the override without modifying the profile). It is hidden for an ACP
-// profile, which names its own backend instead of an LLM profile.
-function syncLlmSelect() {
-  const select = $("new-llm");
+// profile, which names its own backend instead of an LLM profile. `prefix` is
+// the shared stem of the agent-profile and LLM selects: "new" or "campaign".
+function syncLlmSelect(prefix) {
+  const select = $(`${prefix}-llm`);
   select.replaceChildren();
-  const profile = selectedAgentProfile();
+  const profile = selectedAgentProfile(`${prefix}-agent-profile`);
   const acp = profile?.agent_kind === "acp";
   select.disabled = acp;
   if (acp) return;
@@ -349,19 +363,19 @@ function syncLlmSelect() {
   }
 }
 
-function selectedAgentProfile() {
-  const id = $("new-agent-profile").value;
+function selectedAgentProfile(selectId) {
+  const id = $(selectId).value;
   return agentProfiles.find((profile) => profile.id === id) ?? null;
 }
 
 // The agent source for a create request. Present only when the host resolved at
 // least one agent profile; the caller reports "no profile" rather than sending a
 // body the Agent Server would reject.
-function launchSource() {
-  const profile = selectedAgentProfile();
+function launchSource(prefix = "new") {
+  const profile = selectedAgentProfile(`${prefix}-agent-profile`);
   if (!profile) return null;
   const source = { agent_profile_id: profile.id };
-  const llm = $("new-llm").value;
+  const llm = $(`${prefix}-llm`).value;
   // An LLM override only applies to an OpenHands agent profile.
   if (llm && profile.agent_kind !== "acp") {
     source.agent_launch_additions = { llm_profile_ref: llm };
@@ -553,10 +567,11 @@ async function startSeeded() {
   );
 }
 
-// Background spawns: the backend holds the Agent Server credentials (read from
-// its deployment spawner.json), so it can create a campaign root -- and the
-// workers its agent spawns -- directly. Unlike every other Agent Server call on
-// this page, a spawn does not need the page open.
+// Background spawns: the backend holds the Agent Server credentials (discovered
+// from the Agent Server process, or an optional spawner.json override), so it
+// can create a campaign root -- and the workers its agent spawns -- directly.
+// Unlike every other Agent Server call on this page, a spawn does not need the
+// page open.
 let spawnerReady = false;
 
 async function loadSpawner() {
@@ -568,13 +583,14 @@ async function loadSpawner() {
     spawnerReady = Boolean(info.enabled);
     button.disabled = !spawnerReady;
     if (!spawnerReady) {
-      note.textContent = info.config_path
-        ? `Off: create ${info.config_path}`
-        : "Off: no spawner.json in the backend data dir";
+      note.textContent =
+        "Off: no Agent Server session key discovered and no spawner.json override";
       return;
     }
+    const how =
+      info.source === "file" ? "from spawner.json" : "discovered from the Agent Server";
     note.textContent =
-      `Workers spawn at ${info.spawn_path} (${info.public_base_url}); `
+      `Workers spawn at ${info.spawn_path} (${info.public_base_url}), ${how}; `
       + "a container reaches that host directly.";
   } catch (error) {
     spawnerReady = false;
@@ -583,10 +599,29 @@ async function loadSpawner() {
   }
 }
 
+// A campaign's own base agent profile and LLM override, chosen here per
+// campaign. The backend bakes both into the campaign's orchestrator profile, so
+// every worker that campaign spawns inherits them.
+function campaignSource() {
+  const profile = selectedAgentProfile("campaign-agent-profile");
+  if (!profile) return null;
+  const source = { agent_profile_id: profile.id };
+  const llm = $("campaign-llm").value;
+  if (llm && profile.agent_kind !== "acp") {
+    source.llm_profile_ref = llm;
+  }
+  return source;
+}
+
 async function startCampaign() {
   const task = $("campaign-message").value.trim();
   if (!task) {
     $("status").textContent = "Enter a campaign goal.";
+    return;
+  }
+  const source = campaignSource();
+  if (!source) {
+    $("status").textContent = "Pick an OpenHands agent profile for the campaign.";
     return;
   }
   $("status").textContent = "creating campaign…";
@@ -596,7 +631,7 @@ async function startCampaign() {
     const response = await fetch("api/campaign", {
       method: "POST",
       headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ task }),
+      body: JSON.stringify({ task, ...source }),
     });
     body = await response.json();
     ok = response.ok;
@@ -646,7 +681,8 @@ async function clearDurable() {  if (
 $("promote-all").addEventListener("click", () => promote("all"));
 $("clear-durable").addEventListener("click", () => clearDurable());
 $("new-seeded").addEventListener("click", startSeeded);
-$("new-agent-profile").addEventListener("change", syncLlmSelect);
+$("new-agent-profile").addEventListener("change", () => syncLlmSelect("new"));
+$("campaign-agent-profile").addEventListener("change", () => syncLlmSelect("campaign"));
 $("new-campaign").addEventListener("click", startCampaign);
 $("auto-handover").addEventListener("change", refresh);
 (async () => {
