@@ -10,6 +10,8 @@ from .memory import memory_paths, pending_lines, read_text
 from .persistence import (
     DURABLE_GLOBAL_REL,
     DURABLE_PROFILE_DIR,
+    conversation_has_record,
+    conversation_has_state,
     conversation_ids,
     conversation_title,
     display_tags,
@@ -44,6 +46,8 @@ def conversation_state(root: Path) -> list[dict[str, object]]:
                 "id": hex_id,
                 "title": conversation_title(record),
                 "tags": display_tags(record),
+                "has_record": conversation_has_record(root, hex_id),
+                "has_state": conversation_has_state(root, hex_id),
                 "profile_key": key,
                 "profile_key_source": key_source,
                 "profile_name": names.get(key, ""),

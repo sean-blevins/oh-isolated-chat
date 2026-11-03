@@ -28,7 +28,7 @@ button:disabled { opacity: .5; cursor: default; }
 .pending.zero { font-weight: 400; color: var(--muted); }
 .bar { display: flex; align-items: center; gap: 12px; margin: 20px 0 0; }
 .status { color: var(--muted); }
-.actions { display: flex; gap: 8px; }
+.actions { display: flex; flex-wrap: wrap; gap: 8px; }
 pre { margin: 0; padding: 12px; border: 1px solid var(--line); border-radius: 8px; overflow: auto; max-height: 260px; white-space: pre-wrap; }
 .empty { color: var(--muted); font-style: italic; }
 .tier { color: var(--muted); font-size: 12px; }

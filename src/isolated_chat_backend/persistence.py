@@ -11,6 +11,7 @@ from __future__ import annotations
 
 import json
 import re
+import shutil
 from pathlib import Path
 
 # Conversation-local memory, keyed to paths the SDK's own `load_memory` reads.
@@ -23,6 +24,11 @@ DURABLE_PROFILE_DIR = Path("memory") / "agents"
 
 # The conversation's stored start record (Canvas-owned).
 CONVERSATION_META_REL = Path("agent-canvas") / "dev_conversations"
+
+# The SDK's persisted-state file, written inside the same Canvas-owned record
+# directory. Canvas's own listing drops a conversation that has a record but no
+# state file, so its presence is what makes a conversation appear in the sidebar.
+CONVERSATION_STATE_NAME = "base_state.json"
 
 # Host-side config the app reads but never writes.
 AGENT_PROFILES_REL = Path("agent-profiles")
@@ -101,14 +107,54 @@ def conversation_ids(root: Path) -> list[str]:
     return ids
 
 
+def conversation_meta_dir(root: Path, hex_id: str) -> Path:
+    """The Canvas-owned record directory for one conversation."""
+    return root / CONVERSATION_META_REL / hex_id
+
+
 def read_conversation_record(root: Path, hex_id: str) -> dict:
     """The conversation's stored start record, or {} when it is unreadable."""
-    path = root / CONVERSATION_META_REL / hex_id / "meta.json"
+    path = conversation_meta_dir(root, hex_id) / "meta.json"
     try:
         data = json.loads(path.read_text())
     except (OSError, ValueError):
         return {}
     return data if isinstance(data, dict) else {}
+
+
+def conversation_has_record(root: Path, hex_id: str) -> bool:
+    """Whether Canvas has a stored record (``meta.json``) for a conversation.
+
+    Canvas's sidebar lists conversations from these records, so a runtime
+    directory without one is invisible to Canvas -- and has no title to read
+    here either, which is why such a row falls back to ``Untitled``.
+    """
+    return (conversation_meta_dir(root, hex_id) / "meta.json").is_file()
+
+
+def conversation_has_state(root: Path, hex_id: str) -> bool:
+    """Whether a conversation has persisted run state (``base_state.json``).
+
+    Canvas's listing skips a conversation that has a record but no persisted
+    state -- it never ran a turn -- so it stays out of the sidebar even though a
+    runtime directory and a title exist for it here.
+    """
+    return (conversation_meta_dir(root, hex_id) / CONVERSATION_STATE_NAME).is_file()
+
+
+def remove_runtime_dir(root: Path, hex_id: str) -> bool:
+    """Delete one conversation's runtime directory, returning True if it existed.
+
+    The runtime directory is the sandbox home and, usually, its workspace. The
+    Canvas record (``agent-canvas/dev_conversations/<hex>``) and the durable store
+    live elsewhere and are left alone: Canvas owns its record, and the durable
+    store is the whole point of promotion.
+    """
+    directory = runtime_dir(root, hex_id)
+    if not directory.is_dir():
+        return False
+    shutil.rmtree(directory)
+    return True
 
 
 def read_agent_settings(root: Path) -> dict | None:

@@ -1,5 +1,11 @@
 const $ = (id) => document.getElementById(id);
 const short = (id) => id.slice(0, 12);
+// The runtime directory is named with the conversation id's hex (no dashes),
+// but Canvas routes conversation pages by the dashed UUID, so reinsert them.
+const dashed = (hex) =>
+  /^[0-9a-f]{32}$/.test(hex)
+    ? `${hex.slice(0, 8)}-${hex.slice(8, 12)}-${hex.slice(12, 16)}-${hex.slice(16, 20)}-${hex.slice(20)}`
+    : hex;
 const escapeHtml = (value) =>
   String(value).replace(
     /[&<>"']/g,
@@ -62,6 +68,25 @@ const handoverChips = (convo) => {
 const canHandOver = (convo) =>
   Boolean(convo.handover && (convo.handover.requested || convo.handover.doc));
 
+// Why a row is missing from Canvas's sidebar. This view enumerates the Docker
+// runtime directories, so it can show conversations Canvas's own listing drops:
+// a directory with no stored record (no title to read, shown as Untitled), or a
+// record with no persisted state (never ran a turn). Both are deletable here.
+const catalogChips = (convo) => {
+  if (convo.has_record && convo.has_state) return "";
+  const reason = convo.has_record
+    ? "no saved state &middot; never ran a turn"
+    : "no stored record";
+  return (
+    '<div class="chips"><span class="chip warn" title="Canvas\'s sidebar lists a ' +
+    "conversation only once it has a stored record and saved state; this runtime " +
+    'directory is missing at least one, so it does not appear there.">not in ' +
+    "Canvas &middot; " +
+    reason +
+    "</span></div>"
+  );
+};
+
 // The LLM profile a row's fork runs on, "source's own" unless another is picked.
 // The table is rebuilt on every render, so the choice lives in forkProfiles.
 function profilePicker(convo) {
@@ -104,12 +129,20 @@ function render(state) {
       + `<div class="tier"><code>${short(convo.id)}</code> &middot; ${profileLabel(convo)}</div>`
       + tagChips(convo.tags)
       + handoverChips(convo)
+      + catalogChips(convo)
       + `</td>`
       + `<td>${tierCell(convo.tiers.global)}</td>`
       + `<td>${tierCell(convo.tiers.profile)}</td>`;
     const cell = document.createElement("td");
     const actions = document.createElement("div");
     actions.className = "actions";
+    const openButton = document.createElement("button");
+    openButton.textContent = "Open";
+    openButton.title = convo.has_record
+      ? "Open this conversation in Canvas"
+      : "Canvas has no record for this conversation, so it cannot be opened";
+    openButton.disabled = !convo.has_record;
+    openButton.addEventListener("click", () => openConversation(convo));
     const button = document.createElement("button");
     button.textContent = "Promote";
     button.disabled = !(convo.tiers.global.pending + convo.tiers.profile.pending);
@@ -126,7 +159,19 @@ function render(state) {
     forkButton.title =
       "Copy this conversation's full history and state into a new conversation";
     forkButton.addEventListener("click", () => fork(convo));
-    actions.append(button, handoverButton, forkButton, profilePicker(convo));
+    const deleteButton = document.createElement("button");
+    deleteButton.textContent = "Delete";
+    deleteButton.title =
+      "Delete this conversation in Canvas and remove its local runtime directory";
+    deleteButton.addEventListener("click", () => deleteConversation(convo));
+    actions.append(
+      openButton,
+      button,
+      handoverButton,
+      forkButton,
+      profilePicker(convo),
+      deleteButton,
+    );
     cell.append(actions);
     tr.append(cell);
     rows.append(tr);
@@ -263,6 +308,51 @@ async function fork(convo) {
     { source: CHANNEL, type: "navigate", path: `/conversations/${result.data.id}` },
     "*",
   );
+}
+
+// Open a conversation in Canvas. The route lives in Canvas, not this view, so
+// ask the host page to navigate; the id goes as the dashed UUID the route uses.
+function openConversation(convo) {
+  window.parent.postMessage(
+    { source: CHANNEL, type: "navigate", path: `/conversations/${dashed(convo.id)}` },
+    "*",
+  );
+}
+
+// Delete a conversation everywhere it exists. Canvas owns the record and the
+// Docker runtime directory it manages, so ask the host page to delete it there
+// first; then drop any runtime directory the server left behind -- a directory
+// with no Canvas record at all, or a delete that stopped partway. The durable
+// store is untouched, so promoted lines outlive the conversation.
+async function deleteConversation(convo) {
+  const label = convo.title || short(convo.id);
+  const warning = convo.has_record
+    ? `Permanently delete “${label}”?\n\nCanvas loses the conversation and its `
+      + "history, and its local runtime directory (sandbox home, workspace, and "
+      + "the memory it still carries) is removed. Promoted memory in the durable "
+      + "store is kept."
+    : `Remove the leftover runtime directory for “${label}”?\n\nCanvas has no `
+      + "record for it, so this only deletes the local directory. Promoted memory "
+      + "in the durable store is kept.";
+  if (!window.confirm(warning)) return;
+  $("status").textContent = `deleting ${short(convo.id)}…`;
+  const result = await hostRequest(
+    "DELETE",
+    `/api/conversations/${encodeURIComponent(dashed(convo.id))}`,
+  );
+  const canvasGone = result.ok || result.status === 404;
+  await fetch("api/delete", {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ conversation: convo.id }),
+  });
+  if (!canvasGone) {
+    $("status").textContent =
+      `removed the local runtime, but Canvas delete failed: ${result.error ?? "unknown error"}`;
+  } else {
+    $("status").textContent = `deleted ${short(convo.id)}`;
+  }
+  await refresh();
 }
 
 // Hand a conversation over: ask the backend to build the successor (artifact +

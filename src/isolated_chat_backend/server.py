@@ -7,6 +7,7 @@ Routes:
   POST /api/seed      reserve an id + seed the hook plugin for a new conversation
   POST /api/handover  build a detected conversation's successor (artifact + seed)
   POST /api/promote   union one conversation (or "all") into the durable store
+  POST /api/delete    drop one conversation's runtime directory (Canvas owns its record)
   POST /api/clear     debug-only: empty the durable store
   GET  /, /app.css, /app.js   the browser view served from ``web/``
 
@@ -26,7 +27,7 @@ from uuid import UUID, uuid4
 from . import handover
 from .hooks import seed
 from .memory import promote
-from .persistence import conversation_ids, read_agent_settings
+from .persistence import conversation_ids, read_agent_settings, remove_runtime_dir
 from .state import clear_durable, state
 
 # The view's static assets travel with the package, so the artifact is
@@ -102,6 +103,8 @@ class Handler(BaseHTTPRequestHandler):
             return self._seed()
         if route == "/api/handover":
             return self._handover()
+        if route == "/api/delete":
+            return self._delete()
         if route != "/api/promote":
             return self._json(404, {"error": "not found"})
         payload = self._payload()
@@ -195,4 +198,22 @@ class Handler(BaseHTTPRequestHandler):
                 "verdict": verdict,
             },
         )
+
+    def _delete(self) -> None:
+        """Remove one conversation's runtime directory.
+
+        Canvas owns the conversation record and is asked to delete it first (the
+        page's host request); this local half drops whatever the runtime
+        directory still holds -- the sandbox home, the workspace, and the memory
+        the conversation carried. The durable store is untouched, so promoted
+        lines survive the conversation they came from.
+        """
+        payload = self._payload()
+        if payload is None:
+            return self._json(400, {"error": "invalid JSON body"})
+        target = payload.get("conversation")
+        if not isinstance(target, str) or target not in conversation_ids(self.root):
+            return self._json(404, {"error": f"unknown conversation {target!r}"})
+        remove_runtime_dir(self.root, target)
+        return self._json(200, {"deleted": target, "state": state(self.root)})
 

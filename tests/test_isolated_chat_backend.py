@@ -42,6 +42,13 @@ def write_record(root: Path, hex_id: str, **fields: object) -> None:
     (directory / "meta.json").write_text(json.dumps(fields))
 
 
+def write_state(root: Path, hex_id: str) -> None:
+    """Give a conversation the persisted state Canvas needs to list it."""
+    directory = root / "agent-canvas" / "dev_conversations" / hex_id
+    directory.mkdir(parents=True, exist_ok=True)
+    (directory / "base_state.json").write_text(json.dumps({"execution_status": "idle"}))
+
+
 def test_union_appends_only_new_lines() -> None:
     existing = "- a\n- b\n"
     incoming = "- b\n- c\n\n- d\n"
@@ -256,6 +263,47 @@ def test_conversation_state_reports_name_and_tags() -> None:
         assert len(rows) == 1
         assert rows[0]["title"] == "Remember digdigdug"
         assert rows[0]["tags"] == [["topic", "memory"]]
+
+
+def test_conversation_state_flags_rows_canvas_cannot_list() -> None:
+    with tempfile.TemporaryDirectory() as tmp:
+        root = make_tree(Path(tmp))
+        # A runtime directory with no Canvas record at all: no title to read, so
+        # the row is Untitled and Canvas's listing never sees it.
+        (root / "runtime-data" / "ffffffffffffffff").mkdir(parents=True)
+        write_record(root, "aa11bb22cc33dd44", title="test")
+
+        rows = {row["id"]: row for row in state.conversation_state(root)}
+        assert rows["ffffffffffffffff"]["has_record"] is False
+        assert rows["ffffffffffffffff"]["has_state"] is False
+        # A recorded conversation that never ran a turn: Canvas drops it too.
+        assert rows["aa11bb22cc33dd44"]["has_record"] is True
+        assert rows["aa11bb22cc33dd44"]["has_state"] is False
+
+        # Persisted state is the last thing Canvas needs to list the row.
+        write_state(root, "aa11bb22cc33dd44")
+        rows = {row["id"]: row for row in state.conversation_state(root)}
+        assert rows["aa11bb22cc33dd44"]["has_state"] is True
+
+
+def test_remove_runtime_dir_deletes_only_the_runtime_directory() -> None:
+    with tempfile.TemporaryDirectory() as tmp:
+        root = make_tree(Path(tmp))
+        hex_id = "aa11bb22cc33dd44"
+        write_record(root, hex_id, title="keep the record")
+        (root / "memory").mkdir()
+        (root / "memory" / "MEMORY.md").write_text("- durable line\n")
+
+        assert persistence.remove_runtime_dir(root, hex_id) is True
+        assert not (root / "runtime-data" / hex_id).exists()
+        # Canvas owns its record and the durable store is the point of promotion;
+        # neither is touched by the app's delete.
+        assert (
+            root / "agent-canvas" / "dev_conversations" / hex_id / "meta.json"
+        ).is_file()
+        assert (root / "memory" / "MEMORY.md").read_text() == "- durable line\n"
+        # Deleting something already gone is not an error.
+        assert persistence.remove_runtime_dir(root, hex_id) is False
 
 
 def test_clear_durable_removes_both_tiers_and_their_profile_dirs() -> None:

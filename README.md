@@ -193,6 +193,31 @@ by key, and the rest sort A–Z. A Canvas App cannot import the frontend's
 `RESERVED_CONVERSATION_TAG_KEYS`, so the set is mirrored in the backend; if
 Canvas adds a reserved key, the mirror needs the same addition.
 
+## Where the list comes from
+
+This page and Canvas's sidebar answer different questions, so their lists can
+disagree.
+
+- The **sidebar** lists conversations from the Agent Server's catalog
+  (`agent-canvas/dev_conversations/<hex>/meta.json`) and shows only those that
+  have persisted run state (`base_state.json`) beside the record. A conversation
+  that was recorded but never ran a turn has no sidebar row.
+- **This page** lists the Docker runtime directories under `runtime-data/<hex>/`,
+  because those are what it promotes from, forks, and deletes. Every such
+  directory gets a row whether or not Canvas still has a catalog record for it.
+
+The two drift in both directions, so each row now says which side it is on:
+
+| Row | Meaning | In the sidebar? |
+| --- | ------- | --------------- |
+| a title | record + saved state | yes |
+| `Untitled` + **not in Canvas · no stored record** | a runtime directory with no record (e.g. a create that failed after the directory was armed) | no |
+| a title + **not in Canvas · no saved state** | a record that never ran a turn | no |
+
+A row the sidebar omits is still promotable and deletable here. **Delete** asks
+Canvas to delete the conversation (when there is a record) and then removes the
+local runtime directory; the durable store is left alone.
+
 ## Layout
 
 ```
@@ -202,7 +227,8 @@ extension.js             host API 1 page bundle: registers the "chat" page, moun
                          Agent Server requests the backend cannot make
 src/launcher.py          runnable entry point, staged to bin/ in the artifact
 src/isolated_chat_backend/  the host process: stdlib-only Python package
-  persistence.py         the host store layout and conversation records
+  persistence.py         the host store layout, conversation records, and the
+                         runtime-directory removal the Delete action uses
   profiles.py            agent profiles and the durable memory key they own
   memory.py              the promotion line union
   hooks.py               the seed plugin: manifest, hooks, the cheap gate
@@ -210,9 +236,11 @@ src/isolated_chat_backend/  the host process: stdlib-only Python package
                          conversation's runtime dir before it starts
   handover.py            host-side handover: read the cheap request, optional
                          model judgement, build the artifact, seed the successor
-  state.py               the /api/state payload (incl. handover state) and the debug clear
+  state.py               the /api/state payload (handover state + the flags that
+                         say whether Canvas lists a row) and the debug clear
   server.py              HTTP routing (GET /health, /api/state, /, assets;
-                         POST /api/seed, /api/handover, /api/promote, /api/clear)
+                         POST /api/seed, /api/handover, /api/promote, /api/delete,
+                         /api/clear)
   __main__.py            argv parsing, store discovery, serve loop
   web/                   the backend view served to the iframe:
                          index.html, app.css, app.js
@@ -279,6 +307,20 @@ is chosen outside Canvas.
 If the bridge is unavailable the page still loads and explains what the Agent
 Server is missing instead of failing silently.
 
+### If the app view never loads
+
+Canvas mounts the backend view by reaching the app backend origin
+(`OH_APP_BACKEND_PUBLIC_URL`) from the browser. When that origin sits behind a
+private certificate the browser rejects the request before it reaches the server
+(`net::ERR_CERT_AUTHORITY_INVALID`), and Canvas shows only its generic "app view
+is not available" panel. The page probes the origin first: if it is unreachable
+it says so, names the origin, and links to it. Open that link in a new tab,
+accept the certificate warning (**Advanced → Proceed**), then **Retry**.
+
+Trust is per browser profile, so every user who reaches the instance that way
+must accept it once. The durable fix is a certificate the browser already trusts
+— typically a real hostname in front of the instance rather than a bare IP.
+
 ## Limitations
 
 - A missing `launched_agent_profile` is read as the `default` profile. That is
@@ -306,8 +348,9 @@ Server is missing instead of failing silently.
 - A request is armed by writing a `runtime-data/<hex>` directory before the
   conversation is created. If that create then fails, the directory is left
   behind and the listing shows it as a row (the listing enumerates runtime
-  directories). Normal creates succeed; a rejected field is the failure mode to
-  watch.
+  directories), which is why it can hold rows the sidebar does not (see *Where
+  the list comes from*). **Delete** clears such a row. Normal creates succeed; a
+  rejected field is the failure mode to watch.
 - Conversation containers trust the image's CA bundle. If the LLM gateway sits
   behind a private CA (as the served uni.lux gateway does), the container cannot
   reach it until that CA is present in the image or injected — the Agent Server

@@ -28,6 +28,8 @@ const CSS = `
 .oh-isolated-chat__notice, .oh-isolated-chat__setup { box-sizing: border-box; max-width: 72ch; padding: 16px; border: 1px solid currentColor; border-radius: 12px; font-size: 13px; line-height: 1.6; }
 .oh-isolated-chat__notice p { margin: 0 0 8px; }
 .oh-isolated-chat__notice p:last-child { margin-bottom: 0; }
+.oh-isolated-chat__notice a { color: inherit; }
+.oh-isolated-chat__notice code { word-break: break-all; }
 .oh-isolated-chat__setup { max-width: 60ch; margin: 48px auto; padding: 24px; font-size: 14px; }
 .oh-isolated-chat__setup h2 { margin: 0 0 8px; font-size: 18px; }
 .oh-isolated-chat__setup .oh-isolated-chat__status { margin: 0 0 16px; color: #6b7280; }
@@ -68,6 +70,57 @@ function renderBridgeNotice(container) {
   container.replaceChildren(notice);
 }
 
+// The backend view is served from its own origin (``app_backend_ingress_url``),
+// and Canvas reaches it with a cross-origin request before it mounts the frame.
+// On a server fronted by a private certificate, that request fails in the
+// browser before it ever reaches the server, and Canvas then shows a generic
+// "app view not available" panel with no cause. Probe the origin first so we can
+// name the problem and hand the user a link to accept the certificate.
+function renderIngressNotice(container, url, onRetry) {
+  const notice = document.createElement("div");
+  notice.className = "oh-isolated-chat__notice";
+  const first = document.createElement("p");
+  const strong = document.createElement("strong");
+  strong.textContent = "This browser cannot reach the app backend origin.";
+  first.append(strong);
+  const second = document.createElement("p");
+  second.textContent =
+    `The backend view is served from ${url}, and a request to that origin fails ` +
+    "before it reaches the server. On an instance behind a private certificate " +
+    "this usually means the certificate is not trusted yet.";
+  const third = document.createElement("p");
+  const link = document.createElement("a");
+  link.href = url;
+  link.target = "_blank";
+  link.rel = "noreferrer noopener";
+  link.textContent = url;
+  third.append("Open ", link, " in a new tab, accept the certificate warning ");
+  const em = document.createElement("em");
+  em.textContent = "(Advanced → Proceed)";
+  third.append(em, ", then retry.");
+  const actions = document.createElement("div");
+  actions.className = "oh-isolated-chat__actions";
+  const retry = document.createElement("button");
+  retry.className = "primary";
+  retry.textContent = "Retry";
+  retry.addEventListener("click", onRetry);
+  actions.append(retry);
+  notice.append(first, second, third, actions);
+  container.replaceChildren(notice);
+}
+
+// A cross-origin ``no-cors`` request resolves opaquely when the origin is
+// reachable and rejects on a network or certificate failure -- exactly the
+// distinction Canvas's own session request hits, without needing credentials.
+async function ingressReachable(url) {
+  try {
+    await fetch(url, { mode: "no-cors", cache: "no-store" });
+    return true;
+  } catch {
+    return false;
+  }
+}
+
 export function activate(host) {
   if (host.apiVersion !== "1") {
     throw new Error(
@@ -92,6 +145,19 @@ export function activate(host) {
 
     const request = (method, path = BACKEND, body) =>
       host.agentServer.request({ method, path, ...(body ? { body } : {}) });
+
+    // The Agent Server advertises the app backend origin on /server_info. A
+    // failure to read it is not fatal: mount and let Canvas report whatever it
+    // hits, rather than blocking the view on this one request.
+    const appBackendIngress = async () => {
+      try {
+        const info = await request("GET", "/server_info");
+        const url = info?.app_backend_ingress_url;
+        return typeof url === "string" && url ? url : null;
+      } catch {
+        return null;
+      }
+    };
 
     // The host container is a direct child of the page shell that carries the
     // height, and the backend view sizes itself to 100% of whatever element it
@@ -181,6 +247,19 @@ export function activate(host) {
         const status = await request("GET");
         if (disposed) return;
         if (status.state === "ready") {
+          // Canvas mounts the backend view by reaching the app backend origin;
+          // check it first so an unreachable origin (typically an untrusted
+          // certificate) produces an actionable notice instead of Canvas's
+          // generic unavailable panel.
+          const ingress = await appBackendIngress();
+          if (disposed) return;
+          if (ingress && !(await ingressReachable(ingress))) {
+            if (disposed) return;
+            renderIngressNotice(container, ingress, () => {
+              void refresh();
+            });
+            return;
+          }
           mountView();
           return;
         }
@@ -255,6 +334,9 @@ async function proxyRequest(host, frameWindow, origin, message) {
     reply({
       ok: false,
       error: error instanceof Error ? error.message : String(error),
+      // The frontend branches on 404 (already gone) vs. a real failure, and the
+      // host request layer is where the status is still visible.
+      status: typeof error?.status === "number" ? error.status : undefined,
     });
   }
 }
