@@ -29,12 +29,17 @@
 
 <h2>New conversation</h2>
 <div class="bar">
-  <input id="new-message" type="text" size="48" placeholder="First message…">
+  <input id="new-message" type="text" size="40" placeholder="First message…">
+  <select id="new-agent-profile" title="Agent profile the conversation launches on"></select>
+  <select id="new-llm" title="LLM profile this conversation runs on"></select>
   <button id="new-seeded" class="primary">Start with hook</button>
   <span class="note">Starts a conversation this app owns: it seeds the plugin into the
   conversation's runtime directory <em>before</em> creating it, so the container's first run
   already has it. The plugin carries a <code>handover</code> skill and a hook that logs to
-  <code>.openhands/handover/hook.log</code>, counts runs, and detects a handover request.</span>
+  <code>.openhands/handover/hook.log</code>, counts runs, and detects a handover request.
+  The conversation launches on the chosen agent profile, with the chosen LLM profile
+  overriding the profile's own — the same path Canvas's own launcher uses, so the
+  credentials are resolved by the Agent Server and never handled here.</span>
 </div>
 <div class="bar">
   <label class="note"><input id="auto-handover" type="checkbox">

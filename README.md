@@ -121,14 +121,38 @@ container scans `<runtime>/persistence/plugins/` and
 `<runtime>/workspace/.openhands/plugins/`. Seeding a plugin into either is how a
 hook reaches a conversation — no image change and no Agent Server change.
 
-`POST /api/seed` reserves the id (the app chooses it), writes the plugin under
-`<runtime>/persistence/plugins/handover-hook/`, and returns the id plus the
-stored `agent_settings` a launch needs. The page then asks the host to
-`POST /api/conversations` with that id and body. Owning the id is what makes it
-deterministic: a conversation created with an `initial_message` starts running
-inside that same call, so seeding after it is too late. (Canvas-started
-conversations pick their own id; covering those needs a filesystem watcher that
-seeds during container startup, which this app does not do yet.)
+`POST /api/seed` reserves the id (the app chooses it) and writes the plugin under
+`<runtime>/persistence/plugins/handover-hook/`, returning the id. The page then
+asks the host to `POST /api/conversations` with that id and body. Owning the id is
+what makes it deterministic: a conversation created with an `initial_message`
+starts running inside that same call, so seeding after it is too late.
+(Canvas-started conversations pick their own id; covering those needs a
+filesystem watcher that seeds during container startup, which this app does not
+do yet.)
+
+### Launch path and credentials
+
+The create request launches on an **agent profile**, not on a frozen copy of
+`settings.json`: the page reads `GET /api/agent-profiles` and `GET /api/profiles`
+through the host and sends `agent_profile_id` plus, when you pick one,
+`agent_launch_additions.llm_profile_ref`. This is the same path Canvas's own
+launcher uses. The Agent Server resolves the profile against **its own** stores,
+so it decrypts the LLM credential on its side and forwards it, encrypted, to the
+container — the app never holds or transmits an API key.
+
+Earlier revisions read `settings.json`'s `agent_settings` from disk and sent it
+verbatim. That value stores `llm.api_key` **encrypted at rest**, and without the
+`secrets_encrypted` marker the container used the ciphertext as the key, so the
+conversation failed with *"Your LLM API key appears to be invalid or has
+expired."* while Canvas's own UI worked. Sending the profile id removes the
+failure mode entirely, and also yields the profile's standard tool set
+(`terminal`, `file_editor`, `task_tracker`, `browser_tool_set`, …).
+
+The **New conversation** bar offers an agent-profile dropdown and an LLM-profile
+dropdown; the LLM choice overrides the agent profile's own `llm_profile_ref` for
+that one launch (the Agent Server records the override without modifying the
+stored profile). For an ACP agent profile, which names its own backend instead of
+an LLM profile, the LLM dropdown is disabled.
 
 The seeded plugin carries two things: a `handover` **skill** (AgentSkills format,
 `skills/handover/SKILL.md`) and a **hook** (`hooks/hooks.json` dispatching to
@@ -172,12 +196,13 @@ button per row, enabled once the hook has requested one or an artifact exists. A
 
 > **Open item — the second gate.** The cheap gate is live. The optional model
 > judgement (`handover.judge`) reads the conversation's stored `agent_settings`,
-> but the `api_key` there is **encrypted** (the Agent Server decrypts it at
-> launch), so the judge's own HTTP call gets `401` and it fails open — the cheap
-> gate alone currently decides. Making stage two meaningful needs either a
-> decryptable key or, preferably, letting the conversation's *own* agent be the
-> larger model (the `stop` hook can deny the stop and point the agent at the
-> skill). See `plan.md` feature 9.
+> but the `api_key` there is **encrypted at rest** (the Agent Server decrypts it
+> at launch), so `default_complete` now skips the call outright when it sees a
+> ciphertext key and the judgment fails open — the cheap gate alone currently
+> decides. Making stage two meaningful needs either a decryptable key or,
+> preferably, letting the conversation's *own* agent be the larger model (the
+> `stop` hook can deny the stop and point the agent at the skill). See `plan.md`
+> feature 9.
 
 ## Names and tags
 

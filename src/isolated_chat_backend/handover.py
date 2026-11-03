@@ -273,6 +273,12 @@ def default_complete(settings: dict, system: str, user: str) -> str:
     api_key = str(llm.get("api_key") or "")
     if not model or not base_url or not api_key:
         raise ValueError("incomplete LLM configuration")
+    # When a secret key is configured, the stored key is Fernet-encrypted at
+    # rest and only the Agent Server can decrypt it; sending it as a bearer
+    # token would be a guaranteed 401, so skip the judgement rather than leak
+    # the token to the provider. The cheap gate then decides.
+    if api_key.startswith("gAAAAA"):
+        raise ValueError("LLM key is encrypted at rest; no plaintext key for the judge")
     # A LiteLLM-style prefix is for the in-process client, not the HTTP endpoint.
     model = model.split("/", 1)[1] if model.startswith("litellm_proxy/") else model
     body = json.dumps(

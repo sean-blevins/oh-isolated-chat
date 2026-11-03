@@ -578,6 +578,25 @@ def test_judge_returns_none_without_config_or_on_failure() -> None:
         assert handover.judge(root, hex_id, settings={"llm": {}}, complete=boom) is None
 
 
+def test_default_complete_refuses_an_encrypted_key() -> None:
+    # When a secret key is configured, the stored key is Fernet ciphertext that
+    # only the Agent Server can decrypt. Sending it as a bearer token would be a
+    # guaranteed 401 (and leaks the token to the provider), so the judge skips.
+    settings = {
+        "llm": {
+            "model": "litellm_proxy/openrouter/x",
+            "base_url": "https://example.invalid/v1",
+            "api_key": "gAAAAABencryptedtoken",
+        }
+    }
+    try:
+        handover.default_complete(settings, "sys", "user")
+    except ValueError as exc:
+        assert "encrypted" in str(exc)
+    else:
+        raise AssertionError("expected ValueError for an encrypted key")
+
+
 def test_parse_verdict_ignores_prose_and_needs_a_bool() -> None:
     assert handover._parse_verdict('noise {"handover": false, "reason": "x"} tail') == {
         "handover": False,

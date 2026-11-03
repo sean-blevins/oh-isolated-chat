@@ -276,6 +276,7 @@ function hostRequest(method, path, body) {
 // for them up front and offer them per row. A row that picks none forks on the
 // source's own profile.
 let llmProfiles = [];
+let activeLlmProfile = null;
 const forkProfiles = new Map();
 
 async function loadProfiles() {
@@ -286,6 +287,86 @@ async function loadProfiles() {
   }
   const profiles = result.data?.profiles;
   llmProfiles = Array.isArray(profiles) ? profiles : [];
+  activeLlmProfile = result.data?.active_profile ?? null;
+}
+
+// The agent profiles a new conversation can launch on. A conversation created
+// from the app sends `agent_profile_id` (plus a per-launch LLM override in
+// `agent_launch_additions`), which is the same launch path Canvas's own UI uses:
+// the Agent Server resolves the profile's credentials, so this page never sees
+// or forwards an API key. The host resolves the id against its own stores.
+let agentProfiles = [];
+let activeAgentProfileId = null;
+
+async function loadAgentProfiles() {
+  const result = await hostRequest("GET", "/api/agent-profiles");
+  if (!result.ok) {
+    $("status").textContent =
+      `Agent profiles unavailable: ${result.error ?? "unknown error"}`;
+    return;
+  }
+  const profiles = result.data?.profiles;
+  agentProfiles = Array.isArray(profiles) ? profiles : [];
+  activeAgentProfileId = result.data?.active_agent_profile_id ?? null;
+
+  const select = $("new-agent-profile");
+  select.replaceChildren();
+  for (const profile of agentProfiles) {
+    const option = document.createElement("option");
+    option.value = profile.id;
+    option.textContent = profile.name;
+    option.title = `${profile.name} · ${profile.agent_kind}`;
+    select.append(option);
+  }
+  if (activeAgentProfileId) {
+    select.value = activeAgentProfileId;
+  }
+  syncLlmSelect();
+}
+
+// The LLM dropdown lists every saved LLM profile; the chosen one overrides the
+// agent profile's own `llm_profile_ref` for that launch (the Agent Server
+// records the override without modifying the profile). It is hidden for an ACP
+// profile, which names its own backend instead of an LLM profile.
+function syncLlmSelect() {
+  const select = $("new-llm");
+  select.replaceChildren();
+  const profile = selectedAgentProfile();
+  const acp = profile?.agent_kind === "acp";
+  select.disabled = acp;
+  if (acp) return;
+  for (const llm of llmProfiles) {
+    const option = document.createElement("option");
+    option.value = llm.name;
+    option.textContent = llm.name;
+    option.title = llm.model ?? "";
+    select.append(option);
+  }
+  const preferred =
+    profile?.llm_profile_ref ?? activeLlmProfile ?? llmProfiles[0]?.name ?? "";
+  if (llmProfiles.some((llm) => llm.name === preferred)) {
+    select.value = preferred;
+  }
+}
+
+function selectedAgentProfile() {
+  const id = $("new-agent-profile").value;
+  return agentProfiles.find((profile) => profile.id === id) ?? null;
+}
+
+// The agent source for a create request. Present only when the host resolved at
+// least one agent profile; the caller reports "no profile" rather than sending a
+// body the Agent Server would reject.
+function launchSource() {
+  const profile = selectedAgentProfile();
+  if (!profile) return null;
+  const source = { agent_profile_id: profile.id };
+  const llm = $("new-llm").value;
+  // An LLM override only applies to an OpenHands agent profile.
+  if (llm && profile.agent_kind !== "acp") {
+    source.agent_launch_additions = { llm_profile_ref: llm };
+  }
+  return source;
 }
 
 async function fork(convo) {
@@ -378,10 +459,15 @@ async function handOver(convo, { auto = false } = {}) {
     return false;
   }
   const id = prepared.conversation_id;
+  const source = launchSource();
+  if (!source) {
+    $("status").textContent = "No agent profile is available to launch on.";
+    return false;
+  }
   $("status").textContent = `starting successor ${short(id)}…`;
   const result = await hostRequest("POST", "/api/conversations", {
     conversation_id: id,
-    agent_settings: prepared.agent_settings,
+    ...source,
     // No parent_conversation_id: the Docker runtime rejects a parent its new
     // container cannot see. The `handoverfrom` tag carries the chain instead.
     tags: prepared.tags,
@@ -429,6 +515,11 @@ async function startSeeded() {
     $("status").textContent = "Enter a first message.";
     return;
   }
+  const source = launchSource();
+  if (!source) {
+    $("status").textContent = "No agent profile is available to launch on.";
+    return;
+  }
   $("status").textContent = "seeding…";
   const response = await fetch("api/seed", {
     method: "POST",
@@ -443,10 +534,11 @@ async function startSeeded() {
   const id = seeded.conversation_id;
   $("status").textContent = `starting ${short(id)}…`;
   // Only the host page holds Agent Server credentials, so it performs the
-  // create. It gets the id we already seeded and the stored agent source.
+  // create. It gets the id we already seeded and the agent profile to launch
+  // on; the Agent Server resolves the profile's credentials.
   const result = await hostRequest("POST", "/api/conversations", {
     conversation_id: id,
-    agent_settings: seeded.agent_settings,
+    ...source,
     initial_message: { role: "user", content: [{ type: "text", text: message }] },
   });
   if (!result.ok) {
@@ -486,8 +578,10 @@ async function clearDurable() {
 $("promote-all").addEventListener("click", () => promote("all"));
 $("clear-durable").addEventListener("click", () => clearDurable());
 $("new-seeded").addEventListener("click", startSeeded);
+$("new-agent-profile").addEventListener("change", syncLlmSelect);
 $("auto-handover").addEventListener("change", refresh);
 (async () => {
   await loadProfiles();
+  await loadAgentProfiles();
   await refresh();
 })();

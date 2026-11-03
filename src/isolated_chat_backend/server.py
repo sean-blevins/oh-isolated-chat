@@ -121,12 +121,14 @@ class Handler(BaseHTTPRequestHandler):
         return self._json(200, {"promoted": results, "state": state(self.root)})
 
     def _seed(self) -> None:
-        """Reserve a conversation id, seed the hook plugin, hand back the launch body.
+        """Reserve a conversation id and seed the hook plugin.
 
         The app starts the conversation itself (only the host page holds Agent
-        Server credentials), so this prepares the two host-side pieces it cannot
-        make: the id it must own to pre-seed deterministically, and the agent
-        source from ``settings.json``.
+        Server credentials), so this prepares the one host-side piece it cannot
+        make: the id it must own to seed the plugin *before* the container starts.
+        The launch source is an Agent Profile the page resolves through the host
+        (``agent_profile_id``), not the frozen ``agent_settings`` this host
+        stores, so no settings are returned here.
         """
         payload = self._payload()
         if payload is None:
@@ -136,23 +138,11 @@ class Handler(BaseHTTPRequestHandler):
             conversation_id = str(UUID(str(raw_id))) if raw_id else str(uuid4())
         except ValueError:
             return self._json(400, {"error": "conversation_id must be a UUID"})
-        agent_settings = read_agent_settings(self.root)
-        if agent_settings is None:
-            return self._json(
-                409,
-                {
-                    "error": (
-                        "the Agent Server has no stored agent_settings to launch "
-                        "from; open its settings once, then retry"
-                    )
-                },
-            )
         plugin = seed(self.root, UUID(conversation_id).hex)
         return self._json(
             200,
             {
                 "conversation_id": conversation_id,
-                "agent_settings": agent_settings,
                 "plugin": str(plugin),
             },
         )
@@ -164,7 +154,12 @@ class Handler(BaseHTTPRequestHandler):
         this host side does the rest: an optional model judgement, then the
         mechanics only the host can do -- reserve the successor id, seed its
         plugin, write the handover artifact into its workspace, and link the
-        chain both ways. The host page performs the create.
+        chain both ways. The host page performs the create, from an Agent
+        Profile it resolves through the host.
+
+        The judgement reads the host's stored LLM config on a best-effort basis;
+        when that config is unusable the verdict is ``None`` and the cheap gate
+        decides (``handover.judge`` already degrades that way).
         """
         payload = self._payload()
         if payload is None:
@@ -173,16 +168,6 @@ class Handler(BaseHTTPRequestHandler):
         if not isinstance(target, str) or target not in conversation_ids(self.root):
             return self._json(404, {"error": f"unknown conversation {target!r}"})
         agent_settings = read_agent_settings(self.root)
-        if agent_settings is None:
-            return self._json(
-                409,
-                {
-                    "error": (
-                        "the Agent Server has no stored agent_settings to launch "
-                        "from; open its settings once, then retry"
-                    )
-                },
-            )
         successor_id = str(uuid4())
         prepared = handover.prepare(self.root, target, successor_id)
         # The second gate: a model looks at the cheap signals before a handover
@@ -194,7 +179,6 @@ class Handler(BaseHTTPRequestHandler):
             200,
             {
                 **prepared,
-                "agent_settings": agent_settings,
                 "verdict": verdict,
             },
         )
