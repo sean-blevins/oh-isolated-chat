@@ -1341,6 +1341,89 @@ def test_state_reports_spawn_status_per_conversation() -> None:
         assert row["spawn"]["requests"][0]["task"] == "do it"
 
 
+def test_activity_epoch_prefers_updated_then_created_then_mtime() -> None:
+    with tempfile.TemporaryDirectory() as tmp:
+        root = make_tree(Path(tmp))
+        older = "aa11bb22cc33dd44"  # the runtime dir make_tree already made
+        newer = "bb11cc22dd33ee44"
+        (root / "runtime-data" / newer).mkdir(parents=True)
+        # Same creation day; the newer activity is what must order them, so
+        # newest-first uses updated_at before created_at.
+        write_record(
+            root,
+            older,
+            title="old",
+            created_at="2026-01-01T00:00:00+00:00",
+            updated_at="2026-01-02T00:00:00+00:00",
+        )
+        write_record(
+            root,
+            newer,
+            title="new",
+            created_at="2026-01-01T00:00:00Z",
+            updated_at="2026-06-01T00:00:00Z",
+        )
+        rows = {row["id"]: row for row in state.conversation_state(root)}
+        assert rows[newer]["activity_epoch"] > rows[older]["activity_epoch"]
+        # `Z` and `+00:00` both parse, and created_at alone still orders a record
+        # that has no updated_at.
+        assert state.activity_epoch(
+            root, older, {"created_at": "2026-02-01T00:00:00Z"}
+        ) > 0
+
+    with tempfile.TemporaryDirectory() as tmp:
+        root = make_tree(Path(tmp))
+        hex_id = "cc11dd22ee33ff44"
+        (root / "runtime-data" / hex_id).mkdir(parents=True)
+        # No record, or an unparseable timestamp: the directory's mtime still
+        # gives a positive, sortable value.
+        assert state.activity_epoch(root, hex_id, {}) > 0
+        assert state.activity_epoch(root, hex_id, {"updated_at": "not-a-date"}) > 0
+
+
+def test_state_links_a_worker_to_its_parent() -> None:
+    with tempfile.TemporaryDirectory() as tmp:
+        root = make_tree(Path(tmp))
+        parent = "aa11bb22cc33dd44"
+        worker = "bb11cc22dd33ee44"
+        write_record(root, parent, title="parent")
+        write_record(
+            root, worker, title="child", tags={"role": "worker", "spawnedby": parent}
+        )
+        (root / "runtime-data" / worker).mkdir(parents=True)
+        directory = spawner.spawn_dir(root, parent)
+        directory.mkdir(parents=True, exist_ok=True)
+        entry = {
+            "id": worker,
+            "conversation_id": worker,
+            "goal": True,
+            "status": "running",
+            "done": False,
+        }
+        (directory / spawner.LINK_NAME).write_text(json.dumps({"workers": [entry]}))
+
+        rows = {row["id"]: row for row in state.conversation_state(root)}
+        assert rows[parent]["worker"] is False
+        assert rows[parent]["worker_parent"] is None
+        assert rows[parent]["spawn_run"] is None
+        assert rows[worker]["worker"] is True
+        assert rows[worker]["worker_parent"] == parent
+        # The parent's link is the worker's run status, folded onto its row.
+        assert rows[worker]["spawn_run"] == entry
+
+
+def test_state_flags_a_worker_without_a_parent_tag() -> None:
+    with tempfile.TemporaryDirectory() as tmp:
+        root = make_tree(Path(tmp))
+        worker = "bb11cc22dd33ee44"
+        write_record(root, worker, title="orphan", tags={"role": "worker"})
+        (root / "runtime-data" / worker).mkdir(parents=True)
+        rows = {row["id"]: row for row in state.conversation_state(root)}
+        # Tagged as a worker, but nothing to nest it under, so it stays top-level.
+        assert rows[worker]["worker"] is True
+        assert rows[worker]["worker_parent"] is None
+
+
 def main() -> int:
     tests = [value for name, value in sorted(globals().items()) if name.startswith("test_")]
     failures = 0

@@ -297,10 +297,16 @@ Archive is deliberately **not** implemented: there is no archive HTTP endpoint
 The closest public primitive is `DELETE /api/conversations/{id}/runtime`, which
 stops the container while keeping its history and workspace, and is deferred.
 
-The page shows the state per row (`spawn requested`, `spawned <id> · goal
-running`, `spawned <id> · goal complete`, or the last error) and a **Background
-spawns** line in the header reporting whether the watcher found Agent Server
-access and how many workers it has created and completed (`GET /api/spawner`).
+The conversation table is **newest-first by last activity** (the record's
+`updated_at`, then `created_at`) and nests a worker under the conversation that
+spawned it. A parent row carries a toggle (`▸ N workers`,
+tinted while any worker is running and orange if any failed) that expands to show
+its workers, each indented and carrying its run status (`goal running`,
+`goal complete`, `parent not told`, …), nested as deep as workers spawn workers.
+A worker whose parent no longer exists stays at the top level. The parent row
+keeps the `spawn requested` / `spawn error` chips, and the header's **Background
+spawns** line reports whether the watcher found Agent Server access and how many
+workers it has created and completed (`GET /api/spawner`).
 
 > **Open item.** The watcher needs the backend to actually be running (it is a
 > managed backend: Canvas starts it the first time the page is opened) and to

@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import time
+from datetime import datetime
 from pathlib import Path
 
 from . import handover, spawner
@@ -16,8 +17,16 @@ from .persistence import (
     conversation_title,
     display_tags,
     read_conversation_record,
+    runtime_dir,
 )
 from .profiles import profile_key, profile_names
+
+# The tag keys the spawner stamps on a worker at creation; the page groups a
+# worker under its parent by them. Mirrors ``spawner`` without importing the
+# private constants.
+ROLE_TAG = "role"
+WORKER_ROLE = "worker"
+PARENT_TAG = "spawnedby"
 
 
 def conversation_state(root: Path) -> list[dict[str, object]]:
@@ -41,6 +50,7 @@ def conversation_state(root: Path) -> list[dict[str, object]]:
                     else None
                 ),
             }
+        worker, worker_parent = worker_role(record)
         rows.append(
             {
                 "id": hex_id,
@@ -55,9 +65,83 @@ def conversation_state(root: Path) -> list[dict[str, object]]:
                 "handover": handover.status(root, hex_id),
                 "handover_from": _handover_from(record),
                 "spawn": spawner.status(root, hex_id),
+                "created_at": record.get("created_at"),
+                "updated_at": record.get("updated_at"),
+                "activity_epoch": activity_epoch(root, hex_id, record),
+                "worker": worker,
+                "worker_parent": worker_parent,
+                # The worker's live run status lives on its *parent's* link, not
+                # its own spawn dir; folded on below.
+                "spawn_run": None,
             }
         )
+    _link_spawn_runs(rows)
     return rows
+
+
+def activity_epoch(root: Path, hex_id: str, record: dict) -> float:
+    """A sortable "last activity" time for newest-first ordering.
+
+    Prefer the record's ``updated_at`` (its most recent state change), then its
+    ``created_at``; a runtime directory with no readable record (Canvas cannot
+    list it) falls back to its directory mtime, and finally to ``0.0``. Returns a
+    number so the page never has to parse ISO strings just to sort.
+    """
+    for key in ("updated_at", "created_at"):
+        value = record.get(key)
+        if isinstance(value, str):
+            try:
+                return datetime.fromisoformat(value).timestamp()
+            except ValueError:
+                continue
+    try:
+        return runtime_dir(root, hex_id).stat().st_mtime
+    except OSError:
+        return 0.0
+
+
+def worker_role(record: dict) -> tuple[bool, str | None]:
+    """Whether a record is a worker, and the parent hex it links back to.
+
+    The spawner stamps ``role=worker`` and ``spawnedby=<parent hex>`` at
+    creation. This is the durable half of the parent/worker link: it survives
+    even if the parent's ``spawn.json`` is lost, so the page can still nest the
+    worker. Returns ``(False, None)`` for anything that is not a tagged worker.
+    """
+    tags = record.get("tags")
+    if not isinstance(tags, dict):
+        return False, None
+    role = tags.get(ROLE_TAG)
+    parent = tags.get(PARENT_TAG)
+    worker = isinstance(role, str) and role.strip().lower() == WORKER_ROLE
+    if isinstance(parent, str) and parent:
+        return worker, parent.replace("-", "").lower()
+    return worker, None
+
+
+def _link_spawn_runs(rows: list[dict[str, object]]) -> None:
+    """Put each worker's run status on the worker's own row.
+
+    A spawn link lives in the *parent's* spawn directory and lists its workers by
+    the id the app reserved; the worker's own directory only carries the tags.
+    The page groups rows with :func:`worker_role`, so it also needs the run
+    status here to show a nested worker's goal progress.
+    """
+    by_id = {str(row["id"]): row for row in rows}
+    for row in rows:
+        spawn = row.get("spawn")
+        workers = spawn.get("workers") if isinstance(spawn, dict) else None
+        if not isinstance(workers, list):
+            continue
+        for entry in workers:
+            if not isinstance(entry, dict):
+                continue
+            key = entry.get("id")
+            if not isinstance(key, str) or not key:
+                continue
+            child = by_id.get(key.replace("-", "").lower())
+            if child is not None:
+                child["spawn_run"] = entry
 
 
 def _handover_from(record: dict) -> str | None:

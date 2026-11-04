@@ -38,3 +38,10 @@ pre { margin: 0; padding: 12px; border: 1px solid var(--line); border-radius: 8p
 .chip { padding: 1px 8px; border: 1px solid var(--line); border-radius: 999px; font-size: 11px; color: var(--muted); }
 .chip.warn { border-color: #d08a2c; color: #a5650a; background: #fdf3e3; }
 .chip.ok { border-color: #3f9142; color: #2f6b32; background: #edf7ee; }
+/* The collapse/expand control on a parent row: a quiet inline button that
+   reports the worker count, tinted by how the group is doing — muted when all
+   are settled, accent while any run, orange if any failed. */
+.toggle { font: inherit; padding: 0 2px 0 0; border: 0; background: none; color: var(--muted); cursor: pointer; }
+.toggle.live { color: var(--accent); }
+.toggle.warn { color: #a5650a; }
+tr.child .name { font-weight: 500; }

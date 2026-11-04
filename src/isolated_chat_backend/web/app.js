@@ -68,35 +68,45 @@ const handoverChips = (convo) => {
 const canHandOver = (convo) =>
   Boolean(convo.handover && (convo.handover.requested || convo.handover.doc));
 
-// Spawn state for a row: a request the agent left for the watcher, the workers
-// the backend created from it (with their goal/run status), and any last error.
 // A finished worker is only "ok" for a genuine success; a capped goal, an
 // interrupted one, or a worker the host could not start is a warning.
 const spawnSuccess = new Set(["complete", "finished", "done"]);
+
+// Spawn state for a row: a request the agent left for the watcher, and any last
+// error. The workers themselves are nested under this row (see `render`), so
+// their run status is not repeated here.
 const spawnChips = (convo) => {
   const s = convo.spawn ?? {};
   const parts = [];
   if (s.requested) {
     parts.push('<span class="chip warn">spawn requested</span>');
   }
-  for (const worker of s.workers ?? []) {
-    const id = short(worker.conversation_id || worker.id || "");
-    const status = String(worker.status ?? "running");
-    const label = worker.goal ? `goal ${status}` : `${status}`;
-    const kind = worker.done
-      ? spawnSuccess.has(status)
-        ? "chip ok"
-        : "chip warn"
-      : "chip";
-    const notified = worker.done && worker.notified === false ? " · parent not told" : "";
-    parts.push(
-      `<span class="${kind}">spawned ${escapeHtml(id)} · ${escapeHtml(label)}${notified}</span>`,
-    );
-  }
   if (s.last_error) {
     parts.push(`<span class="chip warn">spawn error: ${escapeHtml(s.last_error)}</span>`);
   }
   return parts.length ? `<div class="chips">${parts.join("")}</div>` : "";
+};
+
+// The run status of a worker row: its parent's spawn link records how the goal
+// or run is going (the worker's own directory does not). Shown on the nested row.
+const runChips = (convo) => {
+  const run = convo.spawn_run;
+  if (!run || typeof run !== "object") return "";
+  const status = String(run.status ?? "running");
+  const label = run.goal ? `goal ${status}` : status;
+  const kind = run.done
+    ? spawnSuccess.has(status)
+      ? "chip ok"
+      : "chip warn"
+    : "chip";
+  const parts = [`<span class="${kind}">${escapeHtml(label)}</span>`];
+  if (run.done && run.notified === false) {
+    parts.push('<span class="chip warn">parent not told</span>');
+  }
+  if (run.start_error) {
+    parts.push(`<span class="chip warn">start failed</span>`);
+  }
+  return `<div class="chips">${parts.join("")}</div>`;
 };
 
 // Why a row is missing from Canvas's sidebar. This view enumerates the Docker
@@ -141,7 +151,170 @@ function profilePicker(convo) {
   return select;
 }
 
+// Newest first, by last activity. The backend gives every row a numeric
+// `activity_epoch` (the record's updated_at, then created_at, then the runtime
+// directory's mtime), so the page never has to parse ISO strings just to sort;
+// a missing value sorts last.
+const byNewest = (a, b) => (b.activity_epoch ?? 0) - (a.activity_epoch ?? 0);
+
+// Split the flat conversation list into a parent -> workers tree. A worker nests
+// under the parent its `spawnedby` tag names, but only when that parent is
+// present: a worker whose parent was deleted stays at the top level rather than
+// disappearing. Nesting is recursive, so a worker that spawns its own workers
+// nests again.
+function buildGroups(conversations) {
+  const byId = new Map(conversations.map((convo) => [convo.id, convo]));
+  const children = new Map();
+  const nested = new Set();
+  for (const convo of conversations) {
+    const parent = convo.worker_parent;
+    if (parent && parent !== convo.id && byId.has(parent)) {
+      if (!children.has(parent)) children.set(parent, []);
+      children.get(parent).push(convo);
+      nested.add(convo.id);
+    }
+  }
+  for (const kids of children.values()) kids.sort(byNewest);
+  return { children, nested };
+}
+
+// How many workers hang below this row at any depth, and how they are doing:
+// the collapsed toggle's count and its colour.
+function subtreeStats(children, id) {
+  let total = 0;
+  let running = 0;
+  let failed = 0;
+  const visit = (node) => {
+    for (const child of children.get(node) ?? []) {
+      total += 1;
+      const run = child.spawn_run;
+      if (run && typeof run === "object") {
+        if (run.done) {
+          if (!spawnSuccess.has(String(run.status ?? ""))) failed += 1;
+        } else {
+          running += 1;
+        }
+      }
+      visit(child.id);
+    }
+  };
+  visit(id);
+  return { total, running, failed };
+}
+
+// The Open / Promote / Hand over / Fork / profile / Delete controls for a row.
+function conversationActions(convo) {
+  const actions = document.createElement("div");
+  actions.className = "actions";
+  const openButton = document.createElement("button");
+  openButton.textContent = "Open";
+  openButton.title = convo.has_record
+    ? "Open this conversation in Canvas"
+    : "Canvas has no record for this conversation, so it cannot be opened";
+  openButton.disabled = !convo.has_record;
+  openButton.addEventListener("click", () => openConversation(convo));
+  const button = document.createElement("button");
+  button.textContent = "Promote";
+  button.disabled = !(convo.tiers.global.pending + convo.tiers.profile.pending);
+  button.addEventListener("click", () => promote(convo.id));
+  const handoverButton = document.createElement("button");
+  handoverButton.textContent = "Hand over";
+  handoverButton.title =
+    "Start a fresh conversation seeded with this conversation's handover.md — " +
+    "no context carried, linked back so the chain can be followed";
+  handoverButton.disabled = !canHandOver(convo);
+  handoverButton.addEventListener("click", () => handOver(convo));
+  const forkButton = document.createElement("button");
+  forkButton.textContent = "Fork";
+  forkButton.title =
+    "Copy this conversation's full history and state into a new conversation";
+  forkButton.addEventListener("click", () => fork(convo));
+  const deleteButton = document.createElement("button");
+  deleteButton.textContent = "Delete";
+  deleteButton.title =
+    "Delete this conversation in Canvas and remove its local runtime directory";
+  deleteButton.addEventListener("click", () => deleteConversation(convo));
+  actions.append(
+    openButton,
+    button,
+    handoverButton,
+    forkButton,
+    profilePicker(convo),
+    deleteButton,
+  );
+  return actions;
+}
+
+// One conversation as a table row. `depth` > 0 indents a nested worker, and a
+// row with workers gets a toggle that shows or hides them (see `expanded`).
+function conversationRow(convo, depth, children) {
+  const tr = document.createElement("tr");
+  if (depth > 0) tr.className = "child";
+  const nameCell = document.createElement("td");
+  if (depth > 0) nameCell.style.paddingLeft = `${10 + depth * 20}px`;
+
+  const nameLine = document.createElement("div");
+  nameLine.className = "name";
+  const kids = children.get(convo.id) ?? [];
+  if (kids.length) {
+    const stats = subtreeStats(children, convo.id);
+    const open = expanded.has(convo.id);
+    const toggle = document.createElement("button");
+    toggle.type = "button";
+    toggle.className =
+      "toggle" + (stats.failed ? " warn" : stats.running ? " live" : "");
+    toggle.textContent =
+      `${open ? "▾" : "▸"} ${stats.total} worker${stats.total === 1 ? "" : "s"}`;
+    toggle.title = open ? "Hide workers" : "Show workers";
+    toggle.addEventListener("click", () => {
+      if (expanded.has(convo.id)) expanded.delete(convo.id);
+      else expanded.add(convo.id);
+      if (lastState) render(lastState);
+    });
+    nameLine.append(toggle, " ");
+  }
+  const title = document.createElement("span");
+  title.textContent = convo.title;
+  nameLine.append(title);
+
+  const details = document.createElement("div");
+  details.innerHTML =
+    `<div class="tier"><code>${short(convo.id)}</code> &middot; ${profileLabel(convo)}</div>`
+    + tagChips(convo.tags)
+    + runChips(convo)
+    + handoverChips(convo)
+    + spawnChips(convo)
+    + catalogChips(convo);
+  nameCell.append(nameLine, details);
+
+  const globalCell = document.createElement("td");
+  globalCell.innerHTML = tierCell(convo.tiers.global);
+  const profileCell = document.createElement("td");
+  profileCell.innerHTML = tierCell(convo.tiers.profile);
+  const actionsCell = document.createElement("td");
+  actionsCell.append(conversationActions(convo));
+
+  tr.append(nameCell, globalCell, profileCell, actionsCell);
+  return tr;
+}
+
+// Render a row and, when it is expanded, its workers below it (recursively).
+function appendTree(rows, convo, children, depth) {
+  rows.append(conversationRow(convo, depth, children));
+  if (!expanded.has(convo.id)) return;
+  for (const child of children.get(convo.id) ?? []) {
+    appendTree(rows, child, children, depth + 1);
+  }
+}
+
+// Parent rows whose workers are shown. Collapsed by default — the point of the
+// nesting is a clean list, and the toggle reports the worker count and colour.
+// Kept across re-renders, since any action rebuilds the table.
+const expanded = new Set();
+let lastState = null;
+
 function render(state) {
+  lastState = state;
   const rows = $("rows");
   rows.replaceChildren();
   if (!state.conversations.length) {
@@ -153,61 +326,9 @@ function render(state) {
     tr.append(td);
     rows.append(tr);
   }
-  for (const convo of state.conversations) {
-    const tr = document.createElement("tr");
-    tr.innerHTML =
-      `<td><div class="name">${escapeHtml(convo.title)}</div>`
-      + `<div class="tier"><code>${short(convo.id)}</code> &middot; ${profileLabel(convo)}</div>`
-      + tagChips(convo.tags)
-      + handoverChips(convo)
-      + spawnChips(convo)
-      + catalogChips(convo)
-      + `</td>`
-      + `<td>${tierCell(convo.tiers.global)}</td>`
-      + `<td>${tierCell(convo.tiers.profile)}</td>`;
-    const cell = document.createElement("td");
-    const actions = document.createElement("div");
-    actions.className = "actions";
-    const openButton = document.createElement("button");
-    openButton.textContent = "Open";
-    openButton.title = convo.has_record
-      ? "Open this conversation in Canvas"
-      : "Canvas has no record for this conversation, so it cannot be opened";
-    openButton.disabled = !convo.has_record;
-    openButton.addEventListener("click", () => openConversation(convo));
-    const button = document.createElement("button");
-    button.textContent = "Promote";
-    button.disabled = !(convo.tiers.global.pending + convo.tiers.profile.pending);
-    button.addEventListener("click", () => promote(convo.id));
-    const handoverButton = document.createElement("button");
-    handoverButton.textContent = "Hand over";
-    handoverButton.title =
-      "Start a fresh conversation seeded with this conversation's handover.md — " +
-      "no context carried, linked back so the chain can be followed";
-    handoverButton.disabled = !canHandOver(convo);
-    handoverButton.addEventListener("click", () => handOver(convo));
-    const forkButton = document.createElement("button");
-    forkButton.textContent = "Fork";
-    forkButton.title =
-      "Copy this conversation's full history and state into a new conversation";
-    forkButton.addEventListener("click", () => fork(convo));
-    const deleteButton = document.createElement("button");
-    deleteButton.textContent = "Delete";
-    deleteButton.title =
-      "Delete this conversation in Canvas and remove its local runtime directory";
-    deleteButton.addEventListener("click", () => deleteConversation(convo));
-    actions.append(
-      openButton,
-      button,
-      handoverButton,
-      forkButton,
-      profilePicker(convo),
-      deleteButton,
-    );
-    cell.append(actions);
-    tr.append(cell);
-    rows.append(tr);
-  }
+  const { children, nested } = buildGroups(state.conversations);
+  const top = state.conversations.filter((convo) => !nested.has(convo.id)).sort(byNewest);
+  for (const convo of top) appendTree(rows, convo, children, 0);
 
   const durable = $("durable");
   durable.replaceChildren();
