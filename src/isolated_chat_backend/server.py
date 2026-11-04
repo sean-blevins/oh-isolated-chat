@@ -4,19 +4,13 @@ Routes:
 
   GET  /health        liveness for the managed-backend bridge
   GET  /api/state     conversations + durable store, for the page
-  GET  /api/spawner   whether background spawns are configured, and where
+  GET  /api/spawner   the background spawner's runtime status
   POST /api/seed      reserve an id + seed the hook plugin for a new conversation
   POST /api/handover  build a detected conversation's successor (artifact + seed)
-  POST /api/campaign  create a campaign root (orchestrator profile + conversation)
   POST /api/promote   union one conversation (or "all") into the durable store
   POST /api/delete    drop one conversation's runtime directory (Canvas owns its record)
   POST /api/clear     debug-only: empty the durable store
   GET  /, /app.css, /app.js   the browser view served from ``web/``
-
-A second listener (:class:`SpawnHandler`) serves the spawn route the
-``start_child_conversation`` tool POSTs to; its configuration is discovered from
-the Agent Server by default, with an optional ``spawner.json`` override -- see
-``spawner.py``.
 
 Relative asset URLs in the view resolve against the bridge's ingress mount, so
 the page and its assets stay inside the authenticated path.
@@ -26,7 +20,6 @@ from __future__ import annotations
 
 import json
 import sys
-import urllib.error
 from http.server import BaseHTTPRequestHandler
 from pathlib import Path
 from urllib.parse import urlparse
@@ -36,7 +29,6 @@ from . import handover, spawner
 from .hooks import seed
 from .memory import promote
 from .persistence import conversation_ids, read_agent_settings, remove_runtime_dir
-from .spawner import AgentServerClient, SpawnerConfig
 from .state import clear_durable, state
 
 # The view's static assets travel with the package, so the artifact is
@@ -54,14 +46,9 @@ class Handler(BaseHTTPRequestHandler):
     server_version = "oh-isolated-chat/0.1"
     root: Path
     web_dir: Path = WEB_DIR
-    # Set by ``__main__`` when background spawns are available; ``None`` disables
-    # every background-spawn route (they answer 503 rather than pretend).
-    spawner_config: SpawnerConfig | None = None
-    agent_client: AgentServerClient | None = None
-    spawner_config_path: str = ""
-    # Where the config came from: ``discovered`` (Agent Server process walk /
-    # on-disk key) or ``file`` (an explicit ``spawner.json`` override).
-    spawner_source: str = "none"
+    # The background spawner, if one is running; set by ``__main__`` before the
+    # server starts. ``None`` means spawns are disabled (no Agent Server access).
+    watcher: object = None
 
     def log_message(self, fmt: str, *args: object) -> None:
         sys.stderr.write("[oh-isolated-chat] %s\n" % (fmt % args))
@@ -97,10 +84,16 @@ class Handler(BaseHTTPRequestHandler):
         if route == "/api/state":
             return self._json(200, state(self.root))
         if route == "/api/spawner":
-            return self._spawner_status()
+            return self._json(200, self._spawner_status())
         if self._static(route):
             return
         return self._json(404, {"error": "not found"})
+
+    def _spawner_status(self) -> dict:
+        watcher = self.watcher
+        if watcher is None:
+            return spawner.disabled_status()
+        return watcher.status()
 
     def _payload(self) -> dict | None:
         """Read the request body as a JSON object, or None when it is invalid."""
@@ -122,8 +115,6 @@ class Handler(BaseHTTPRequestHandler):
             return self._seed()
         if route == "/api/handover":
             return self._handover()
-        if route == "/api/campaign":
-            return self._campaign()
         if route == "/api/delete":
             return self._delete()
         if route != "/api/promote":
@@ -221,114 +212,4 @@ class Handler(BaseHTTPRequestHandler):
             return self._json(404, {"error": f"unknown conversation {target!r}"})
         remove_runtime_dir(self.root, target)
         return self._json(200, {"deleted": target, "state": state(self.root)})
-
-    def _spawner_status(self) -> None:
-        """Whether background spawns are wired, for the page to show an honest state."""
-        config = self.spawner_config
-        return self._json(
-            200,
-            {
-                "enabled": config is not None,
-                "source": self.spawner_source,
-                "config_path": self.spawner_config_path,
-                "public_base_url": config.base_url if config else None,
-                "spawn_path": config.spawn_path if config else None,
-                "listen": (
-                    f"{config.listen_host}:{config.listen_port}" if config else None
-                ),
-                "agent_server_url": config.agent_server_url if config else None,
-            },
-        )
-
-    def _campaign(self) -> None:
-        """Create a campaign root: a dedicated orchestrator profile + conversation.
-
-        The profile carries the ``start_child_conversation`` tool aimed at this
-        deployment's spawn endpoint, so the root's agent can spawn workers in the
-        background. Only the backend can create it, because only the backend
-        holds the Agent Server credentials (the page would need a request per
-        step, and a spawn must not depend on the page being open).
-
-        The caller chooses the base agent profile -- and optionally the LLM
-        profile -- per campaign, so the workers it spawns inherit that choice
-        through the URL baked into the orchestrator profile.
-        """
-        if self.spawner_config is None or self.agent_client is None:
-            return self._json(
-                503,
-                {
-                    "error": "background spawns are not configured",
-                    "config_path": self.spawner_config_path,
-                },
-            )
-        payload = self._payload()
-        if payload is None:
-            return self._json(400, {"error": "invalid JSON body"})
-        task = payload.get("task")
-        if not isinstance(task, str) or not task.strip():
-            return self._json(400, {"error": "task is required"})
-        title = payload.get("title")
-        title = title if isinstance(title, str) and title.strip() else None
-        agent_profile_id = payload.get("agent_profile_id")
-        if not isinstance(agent_profile_id, str) or not agent_profile_id.strip():
-            return self._json(400, {"error": "agent_profile_id is required"})
-        llm_profile_ref = payload.get("llm_profile_ref")
-        llm_profile_ref = (
-            llm_profile_ref
-            if isinstance(llm_profile_ref, str) and llm_profile_ref.strip()
-            else None
-        )
-        try:
-            result = spawner.create_campaign(
-                self.spawner_config,
-                self.root,
-                task,
-                title,
-                agent_profile_id,
-                llm_profile_ref,
-                self.agent_client,
-            )
-        except urllib.error.HTTPError as exc:
-            return self._json(502, {"error": f"Agent Server rejected: {exc}"})
-        except (urllib.error.URLError, OSError, ValueError) as exc:
-            return self._json(502, {"error": f"campaign failed: {exc}"})
-        return self._json(200, result)
-
-
-class SpawnHandler(Handler):
-    """The listener the ``start_child_conversation`` tool POSTs to.
-
-    The tool executes in the Agent Server process (an in-process caller), and
-    this backend is that process's child, so the tool reaches this listener over
-    the Agent Server's own loopback -- the same address the tool's default
-    launcher uses. It creates a top-level worker through the Agent Server and
-    replies with the tool's response shape. No browser page is involved, so a
-    spawn runs entirely in the background.
-    """
-
-    def do_GET(self) -> None:  # noqa: N802 - BaseHTTPRequestHandler API
-        if urlparse(self.path).path == "/health":
-            return self._json(200, {"status": "ok"})
-        return self._json(404, {"error": "not found"})
-
-    def do_POST(self) -> None:  # noqa: N802 - BaseHTTPRequestHandler API
-        config = self.spawner_config
-        if config is None or self.agent_client is None:
-            return self._json(503, {"detail": "background spawns are not configured"})
-        if urlparse(self.path).path != config.spawn_path:
-            return self._json(404, {"detail": "not found"})
-        body = self._payload()
-        try:
-            request = spawner.parse_spawn_request(self.path, body)
-        except ValueError as exc:
-            return self._json(400, {"detail": str(exc)})
-        try:
-            result = spawner.spawn_worker(
-                config, self.root, request, self.agent_client
-            )
-        except urllib.error.HTTPError as exc:
-            return self._json(502, {"detail": f"Agent Server rejected: {exc}"})
-        except (urllib.error.URLError, OSError, ValueError) as exc:
-            return self._json(502, {"detail": f"spawn failed: {exc}"})
-        return self._json(200, result)
 

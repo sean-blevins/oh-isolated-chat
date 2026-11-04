@@ -5,7 +5,7 @@ from __future__ import annotations
 import time
 from pathlib import Path
 
-from . import handover
+from . import handover, spawner
 from .memory import memory_paths, pending_lines, read_text
 from .persistence import (
     DURABLE_GLOBAL_REL,
@@ -54,6 +54,7 @@ def conversation_state(root: Path) -> list[dict[str, object]]:
                 "tiers": tiers,
                 "handover": handover.status(root, hex_id),
                 "handover_from": _handover_from(record),
+                "spawn": spawner.status(root, hex_id),
             }
         )
     return rows

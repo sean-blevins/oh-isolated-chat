@@ -607,435 +607,297 @@ def test_parse_verdict_ignores_prose_and_needs_a_bool() -> None:
     assert handover._parse_verdict("not json at all") is None
 
 
-# ----- spawner --------------------------------------------------------------
+class FakeAgentServer:
+    """The bits of the Agent Server client the spawner uses, recorded in memory."""
+
+    def __init__(self, profiles: dict | None = None, error: Exception | None = None):
+        self.payloads: list[dict] = []
+        self._profiles = profiles or {"profiles": [], "active_agent_profile_id": None}
+        self._error = error
+
+    def list_agent_profiles(self) -> dict:
+        return self._profiles
+
+    def create_conversation(self, payload: dict) -> dict:
+        if self._error is not None:
+            raise self._error
+        self.payloads.append(payload)
+        return {"id": payload["conversation_id"], "execution_status": "running"}
 
 
-class FakeClient:
-    """Stand-in for AgentServerClient: records what the app would send/save."""
-
-    def __init__(self, created=None, profiles=None, profile_id="profile-new"):
-        self.created = created or {"id": "99998888-7777-6666-5555-444433332222"}
-        self.profiles = profiles or []
-        self.profile_id = profile_id
-        self.saved = {}
-        self.conversation_payloads = []
-
-    def list_agent_profiles(self):
-        return {"profiles": self.profiles, "active_agent_profile_id": None}
-
-    def get_agent_profile(self, name):
-        return {"profile": {**self.saved.get(name, {}), "id": self.profile_id}}
-
-    def save_agent_profile(self, name, profile):
-        self.saved[name] = profile
-        return {"name": name}
-
-    def create_conversation(self, payload):
-        self.conversation_payloads.append(payload)
-        return self.created
+def write_spawn_request(root: Path, hex_id: str, name: str, **fields: object) -> Path:
+    directory = spawner.spawn_dir(root, hex_id)
+    directory.mkdir(parents=True, exist_ok=True)
+    path = directory / name
+    path.write_text(json.dumps(fields))
+    return path
 
 
-def spawner_config(**overrides) -> spawner.SpawnerConfig:
-    base = {
-        "agent_server_url": "http://127.0.0.1:18000",
-        "session_key": "key",
-        "listen_port": 59777,
-    }
-    base.update(overrides)
-    return spawner.config_from_dict(base)
-
-
-def test_spawner_config_defaults_the_base_url_to_the_agent_server_host() -> None:
-    config = spawner_config()
-    # The child-launch tool runs in the Agent Server's namespace, so the
-    # endpoint's reachable host is the Agent Server's own host -- here the
-    # loopback address discovered from its argv -- not the Docker gateway.
-    assert config.reachable_host == "127.0.0.1"
-    assert config.base_url == "http://127.0.0.1:59777"
-    assert config.spawn_url("aa11bb22cc33dd44") == (
-        "http://127.0.0.1:59777/api/spawn?campaign=aa11bb22cc33dd44"
-    )
-
-
-def test_spawner_config_rewrites_a_wildcard_agent_server_bind_to_loopback() -> None:
-    config = spawner_config(agent_server_url="http://0.0.0.0:18000")
-    assert config.reachable_host == "127.0.0.1"
-    assert config.base_url == "http://127.0.0.1:59777"
-
-
-def test_spawner_config_prefers_an_explicit_public_base_url() -> None:
-    config = spawner_config(public_base_url="https://apps.example/lit")
-    assert config.spawn_url("aa") == (
-        "https://apps.example/lit/api/spawn?campaign=aa"
-    )
-
-
-def test_spawn_url_carries_the_worker_profile_and_llm_choice() -> None:
-    config = spawner_config()
-    url = config.spawn_url("aa11bb22cc33dd44", "worker-profile", "deepseek")
-    assert "campaign=aa11bb22cc33dd44" in url
-    assert "profile=worker-profile" in url
-    assert "llm=deepseek" in url
-
-
-def test_spawner_config_requires_an_agent_server_url() -> None:
-    try:
-        spawner.config_from_dict({"session_key": "k", "listen_port": 1})
-    except spawner.SpawnerConfigError:
-        pass
-    else:
-        raise AssertionError("expected SpawnerConfigError when agent_server_url is absent")
-    # A missing session key is allowed: discovery may supply it afterwards.
-    assert spawner.config_from_dict({"agent_server_url": "http://x"}).session_key == ""
-
-
-def test_load_spawner_config_reads_the_data_dir_and_a_key_file() -> None:
+def test_seed_contributes_the_spawn_skill() -> None:
     with tempfile.TemporaryDirectory() as tmp:
-        data_dir = Path(tmp)
-        root = data_dir / "runtime"
-        root.mkdir()
-        key_file = data_dir / "api-key.txt"
-        key_file.write_text("secret-key\n")
-        (data_dir / "spawner.json").write_text(
+        root = make_tree(Path(tmp))
+        plugin = hooks.seed(root, "cc11dd22ee33ff44")
+        skill = plugin / hooks.SPAWN_SKILL_REL
+        assert skill.is_file()
+        text = skill.read_text()
+        assert text.startswith("---")
+        assert "name: spawn" in text
+        assert ".openhands/spawn/request-" in text
+        assert "self-contained" in text
+
+
+def test_agent_server_url_is_parsed_from_the_cmdline() -> None:
+    cmdline = ["openhands-agent-server", "--host", "0.0.0.0", "--port", "18000"]
+    # A wildcard bind is rewritten to loopback, matching the tool's own default.
+    assert (
+        spawner._agent_server_from_cmdline(cmdline) == "http://127.0.0.1:18000"
+    )
+    assert (
+        spawner._agent_server_from_cmdline(["--host=10.0.0.5", "--port=9000"])
+        == "http://10.0.0.5:9000"
+    )
+    assert spawner._agent_server_from_cmdline(["no", "port"]) is None
+
+
+def test_session_key_is_read_from_the_env_or_its_key_path() -> None:
+    assert spawner._session_key_from_env({"OH_SESSION_API_KEYS_0": "  k1  "}) == "k1"
+    with tempfile.TemporaryDirectory() as tmp:
+        key_file = Path(tmp) / "key.txt"
+        key_file.write_text("k2\n")
+        env = {
+            "OH_SESSION_API_KEY_PATH": str(key_file),
+            "OH_SESSION_API_KEYS_0": "ignored",
+        }
+        assert spawner._session_key_from_env(env) == "k2"
+
+
+def test_discovery_is_empty_without_ancestors() -> None:
+    assert spawner.discover_environment(ancestors=[]) == {}
+
+
+def test_config_from_dict_validates_and_defaults() -> None:
+    config = spawner.config_from_dict(
+        {"agent_server_url": "http://127.0.0.1:8000/", "session_key": " k "}
+    )
+    assert config.agent_server_url == "http://127.0.0.1:8000"
+    assert config.session_key == "k"
+    assert config.poll_interval == spawner.DEFAULT_POLL_INTERVAL
+    for bad in ({}, {"agent_server_url": "http://x", "poll_interval": 0}):
+        try:
+            spawner.config_from_dict(bad)
+        except spawner.SpawnerConfigError:
+            pass
+        else:
+            raise AssertionError(f"expected SpawnerConfigError for {bad!r}")
+
+
+def test_load_config_reads_an_override_file() -> None:
+    with tempfile.TemporaryDirectory() as tmp:
+        root = make_tree(Path(tmp))
+        data_dir = Path(tmp) / "data"
+        data_dir.mkdir()
+        config_file = data_dir / spawner.CONFIG_NAME
+        config_file.write_text(
             json.dumps(
                 {
-                    "agent_server_url": "http://127.0.0.1:18000",
-                    "session_key_path": str(key_file),
-                    "agent_profile_id": "base",
+                    "agent_server_url": "http://127.0.0.1:18111",
+                    "session_key": "from-file",
+                    "agent_profile_id": "fallback-profile",
                 }
             )
         )
-        config = spawner.load_spawner_config(data_dir, root, env={})
+        config = spawner.load_config(data_dir, root, env={})
         assert config is not None
-        assert config.session_key == "secret-key"
-        assert config.agent_profile_id == "base"
+        assert config.agent_server_url == "http://127.0.0.1:18111"
+        assert config.session_key == "from-file"
+        assert config.agent_profile_id == "fallback-profile"
+        # The env override names a different path, which does not exist.
+        other = spawner.load_config(data_dir, root, env={spawner.CONFIG_ENV: "/nope"})
+        # No file and (in the test process) no ancestor key -> disabled.
+        assert other is None
 
 
-def test_load_spawner_config_is_none_when_nothing_is_discoverable() -> None:
-    with tempfile.TemporaryDirectory() as tmp:
-        data_dir = Path(tmp)
-        original = spawner.discover
-        spawner.discover = lambda root: {}
+def test_parse_request_requires_task_and_reads_aliases() -> None:
+    request = spawner.parse_request(
+        {"task": "do it", "title": "T", "profile": "p1", "llm": "l1"}
+    )
+    assert (request.task, request.title, request.agent_profile_id) == ("do it", "T", "p1")
+    assert request.llm_profile_ref == "l1"
+    request = spawner.parse_request({"task": "x", "agent_profile_id": "p2"})
+    assert request.agent_profile_id == "p2"
+    for bad in ({}, {"task": "  "}, "not a dict"):
         try:
-            assert spawner.load_spawner_config(data_dir, data_dir, env={}) is None
-        finally:
-            spawner.discover = original
-
-
-def test_load_spawner_config_is_discovered_with_no_file() -> None:
-    with tempfile.TemporaryDirectory() as tmp:
-        data_dir = Path(tmp)
-        original = spawner.discover
-        spawner.discover = lambda root: {
-            "agent_server_url": "http://127.0.0.1:18000",
-            "session_key": "discovered-key",
-        }
-        try:
-            config = spawner.load_spawner_config(data_dir, data_dir, env={})
-        finally:
-            spawner.discover = original
-        assert config is not None
-        assert config.session_key == "discovered-key"
-
-
-def test_discover_reads_the_session_key_from_the_persistence_root() -> None:
-    with tempfile.TemporaryDirectory() as tmp:
-        root = Path(tmp)
-        (root / "agent-canvas").mkdir()
-        (root / "agent-canvas" / "api-key.txt").write_text("disk-key\n")
-        original = spawner.discover_persistence_environment
-        spawner.discover_persistence_environment = lambda: {}
-        try:
-            found = spawner.discover(root)
-        finally:
-            spawner.discover_persistence_environment = original
-        assert found["session_key"] == "disk-key"
-        assert found["agent_server_url"] == spawner.DEFAULT_AGENT_SERVER_URL
-
-
-def test_agent_server_from_cmdline_parses_host_and_port() -> None:
-    assert spawner._agent_server_from_cmdline(
-        ["agent-server", "--host", "127.0.0.1", "--port", "18000"]
-    ) == "http://127.0.0.1:18000"
-    assert spawner._agent_server_from_cmdline(["x", "--port=18000"]) == (
-        "http://127.0.0.1:18000"
-    )
-    assert spawner._agent_server_from_cmdline(
-        ["--host", "0.0.0.0", "--port", "9"]
-    ) == "http://127.0.0.1:9"
-    assert spawner._agent_server_from_cmdline(["no-port"]) is None
-
-
-def test_session_key_from_env_prefers_the_key_file() -> None:
-    with tempfile.TemporaryDirectory() as tmp:
-        path = Path(tmp) / "key"
-        path.write_text("file-key\n")
-        env = {"OH_SESSION_API_KEY_PATH": str(path), "OH_SESSION_API_KEYS_0": "env-key"}
-        assert spawner._session_key_from_env(env) == "file-key"
-    assert spawner._session_key_from_env({"OH_SESSION_API_KEYS_0": "env-key"}) == "env-key"
-
-
-def _patch_proc(envs: dict, cmds: dict):
-    """Patch the /proc reads and return a restore callable."""
-    original = (
-        spawner._ancestors,
-        spawner._read_proc_environ,
-        spawner._read_proc_cmdline,
-    )
-    spawner._ancestors = lambda: iter(sorted(envs))
-    spawner._read_proc_environ = lambda pid: envs.get(pid, {})
-    spawner._read_proc_cmdline = lambda pid: cmds.get(pid, [])
-
-    def restore() -> None:
-        (
-            spawner._ancestors,
-            spawner._read_proc_environ,
-            spawner._read_proc_cmdline,
-        ) = original
-
-    return restore
-
-
-def test_discover_identifies_the_agent_server_by_its_session_key() -> None:
-    # An intermediate process may carry the backend's own --port; it must be
-    # ignored in favour of the ancestor that actually holds the session key.
-    envs = {
-        111: {"OPENCODE_SESSION_ID": "x"},
-        222: {
-            "OH_SESSION_API_KEYS_0": "the-key",
-            "OH_APP_BACKEND_PUBLIC_URL": "http://127.0.0.1:18000",
-        },
-    }
-    cmds = {
-        111: ["sh", "-c", "isolated-chat-backend --port=59998"],
-        222: ["agent-server", "--host", "127.0.0.1", "--port", "18000"],
-    }
-    restore = _patch_proc(envs, cmds)
-    try:
-        found = spawner.discover_persistence_environment()
-    finally:
-        restore()
-    assert found == {
-        "agent_server_url": "http://127.0.0.1:18000",
-        "session_key": "the-key",
-    }
-
-
-def test_discover_falls_back_to_the_public_url_without_a_key() -> None:
-    envs = {111: {"OH_APP_BACKEND_PUBLIC_URL": "http://127.0.0.1:18000"}}
-    restore = _patch_proc(envs, {})
-    try:
-        found = spawner.discover_persistence_environment()
-    finally:
-        restore()
-    assert found == {"agent_server_url": "http://127.0.0.1:18000", "session_key": ""}
-
-
-def test_config_path_honours_an_explicit_override() -> None:
-    env = {spawner.CONFIG_ENV: "/etc/oh-isolated-chat/spawner.json"}
-    assert spawner.config_path(Path("/data"), env) == Path(
-        "/etc/oh-isolated-chat/spawner.json"
-    )
-
-
-def test_worker_payload_is_top_level_and_tagged_for_the_campaign() -> None:
-    payload = spawner.build_worker_payload(
-        spawner_config(),
-        "11112222-3333-4444-5555-666677778888",
-        "aa11bb22cc33dd44",
-        "Port the login form",
-        "Login form",
-        "worker-profile",
-        "deepseek",
-    )
-    # Top-level: no native parent, the chain travels as tags only.
-    assert "parent_conversation_id" not in payload
-    assert payload["tags"] == {
-        "role": "worker",
-        "spawnedby": "aa11bb22cc33dd44",
-        "campaign": "aa11bb22cc33dd44",
-    }
-    assert payload["agent_profile_id"] == "worker-profile"
-    assert payload["agent_launch_additions"] == {"llm_profile_ref": "deepseek"}
-    # The task is the worker's first message, so the create starts it running.
-    assert payload["initial_message"]["content"][0]["text"] == "Port the login form"
-    assert payload["title"] == "Login form"
-
-
-def test_spawn_worker_seeds_before_creating_and_shapes_the_tool_reply() -> None:
-    with tempfile.TemporaryDirectory() as tmp:
-        root = make_tree(Path(tmp))
-        config = spawner_config()
-        client = FakeClient()
-        seeded: list[str] = []
-        request = spawner.SpawnRequest(
-            campaign_id="aa11bb22cc33dd44",
-            task="Do the thing",
-            title="Thing",
-            isolation="shared",
-            agent_profile_id="worker-profile",
-            llm_profile_ref=None,
-        )
-
-        result = spawner.spawn_worker(
-            config,
-            root,
-            request,
-            client,
-            reserve=lambda: "11112222-3333-4444-5555-666677778888",
-            seed=lambda r, hex_id: seeded.append(hex_id),
-        )
-
-        # Seeded for the reserved id before the create call.
-        assert seeded == ["11112222333344445555666677778888"]
-        assert len(client.conversation_payloads) == 1
-        assert client.conversation_payloads[0]["agent_profile_id"] == "worker-profile"
-        # The reply matches StartChildConversationResponse: the campaign is echoed
-        # as the logical parent, along with the child's own id and the isolation.
-        assert result == {
-            "conversation_id": "99998888-7777-6666-5555-444433332222",
-            "parent_conversation_id": "aa11bb22cc33dd44",
-            "status": "idle",
-            "title": "Thing",
-            "url": None,
-            "workspace": None,
-            "isolation": "shared",
-        }
-
-
-def test_spawn_worker_requires_a_campaign_and_a_profile() -> None:
-    with tempfile.TemporaryDirectory() as tmp:
-        root = make_tree(Path(tmp))
-        client = FakeClient()
-        base = dict(
-            campaign_id="aa11bb22cc33dd44",
-            task="Do it",
-            title=None,
-            isolation="worktree",
-            agent_profile_id="worker-profile",
-            llm_profile_ref=None,
-        )
-        for change in ({"campaign_id": None}, {"agent_profile_id": None}):
-            request = spawner.SpawnRequest(**{**base, **change})
-            try:
-                spawner.spawn_worker(spawner_config(), root, request, client)
-            except spawner.SpawnerConfigError:
-                continue
-            raise AssertionError(f"expected SpawnerConfigError for {change}")
-
-
-def test_normalize_isolation_only_accepts_the_two_literals() -> None:
-    assert spawner.normalize_isolation("shared") == "shared"
-    assert spawner.normalize_isolation("worktree") == "worktree"
-    assert spawner.normalize_isolation("bogus") == "worktree"
-    assert spawner.normalize_isolation(None) == "worktree"
-
-
-def test_parse_spawn_request_reads_the_campaign_token_and_validates_task() -> None:
-    request = spawner.parse_spawn_request(
-        "/api/spawn?campaign=aa11bb22cc33dd44&profile=worker-profile&llm=deepseek",
-        {"task": "Do it", "title": "T", "isolation": "shared"},
-    )
-    assert request.campaign_id == "aa11bb22cc33dd44"
-    assert request.agent_profile_id == "worker-profile"
-    assert request.llm_profile_ref == "deepseek"
-    assert (request.task, request.title, request.isolation) == ("Do it", "T", "shared")
-
-    for body in (None, {}, {"task": "   "}):
-        try:
-            spawner.parse_spawn_request("/api/spawn?campaign=x", body)
+            spawner.parse_request(bad)
         except ValueError:
-            continue
-        raise AssertionError(f"expected ValueError for body {body!r}")
+            pass
+        else:
+            raise AssertionError(f"expected ValueError for {bad!r}")
 
 
-def test_orchestrator_profile_binds_the_spawn_tool_to_the_campaign_url() -> None:
-    profile = spawner.orchestrator_profile(
-        "orchestrator-abc", "deepseek", "http://host.docker.internal:59777/api/spawn?campaign=x"
-    )
-    spawn_tool = next(
-        tool for tool in profile["tools"] if tool["name"] == "start_child_conversation"
-    )
-    assert spawn_tool["params"]["launch_url"] == (
-        "http://host.docker.internal:59777/api/spawn?campaign=x"
-    )
-    # The default set (None) cannot be extended, so the profile names it.
-    names = {tool["name"] for tool in profile["tools"]}
-    assert {"terminal", "file_editor", "task_tracker"} <= names
-    assert profile["llm_profile_ref"] == "deepseek"
-    assert profile["agent_kind"] == "openhands"
-
-
-def test_resolve_llm_profile_ref_prefers_the_choice_then_the_base_profile() -> None:
-    client = FakeClient(
-        profiles=[{"id": "base-profile", "llm_profile_ref": "from-base"}]
-    )
-    assert spawner.resolve_llm_profile_ref(client, "base-profile", None) == "from-base"
-    assert spawner.resolve_llm_profile_ref(client, "base-profile", "chosen") == "chosen"
-
-
-def test_create_campaign_saves_a_profile_and_starts_a_tagged_root() -> None:
+def test_find_requests_skips_the_link_record() -> None:
     with tempfile.TemporaryDirectory() as tmp:
         root = make_tree(Path(tmp))
-        client = FakeClient(
-            profiles=[{"id": "base-profile", "llm_profile_ref": "from-base"}]
-        )
-        seeded: list[str] = []
+        hex_id = "aa11bb22cc33dd44"
+        write_spawn_request(root, hex_id, "request-1.json", task="one")
+        (spawner.spawn_dir(root, hex_id) / spawner.LINK_NAME).write_text("{}")
+        found = spawner.find_requests(root)
+        assert [(entry[0], entry[1].name) for entry in found] == [
+            (hex_id, "request-1.json")
+        ]
 
-        result = spawner.create_campaign(
-            spawner_config(),
+
+def test_spawn_worker_seeds_and_creates_a_top_level_worker() -> None:
+    with tempfile.TemporaryDirectory() as tmp:
+        root = make_tree(Path(tmp))
+        parent = "aa11bb22cc33dd44"
+        write_record(
+            root, parent, launched_agent_profile={"agent_profile_id": "parent-profile"}
+        )
+        config = spawner.SpawnerConfig(
+            agent_server_url="http://x", session_key="k", agent_profile_id="cfg"
+        )
+        client = FakeAgentServer()
+        request = spawner.SpawnRequest(task="do it", title="T")
+        entry = spawner.spawn_worker(
             root,
-            "Port the feature",
-            "Feature",
-            "base-profile",
-            None,
+            parent,
+            request,
+            config,
             client,
-            reserve=lambda: "11112222-3333-4444-5555-666677778888",
-            seed=lambda r, hex_id: seeded.append(hex_id),
+            reserve=lambda: "11111111-2222-3333-4444-555555555555",
         )
-
-        name = result["agent_profile_name"]
-        assert name == "orchestrator-111122223333"
-        saved = client.saved[name]
-        spawn_tool = next(
-            tool
-            for tool in saved["tools"]
-            if tool["name"] == "start_child_conversation"
-        )
-        launch_url = spawn_tool["params"]["launch_url"]
-        assert "campaign=11112222333344445555666677778888" in launch_url
-        # The worker's chosen agent profile and the resolved LLM ride the URL.
-        assert "profile=base-profile" in launch_url
-        assert "llm=from-base" in launch_url
-        assert seeded == ["11112222333344445555666677778888"]
-        payload = client.conversation_payloads[-1]
-        assert payload["agent_profile_id"] == "profile-new"
-        assert payload["tags"] == {
-            "role": "orchestrator",
-            "campaign": "11112222333344445555666677778888",
-        }
-        assert result["conversation_id"] == client.created["id"]
-        assert result["worker_agent_profile_id"] == "base-profile"
-        assert result["spawn_url"] == launch_url
+        payload = client.payloads[0]
+        assert payload["conversation_id"] == "11111111-2222-3333-4444-555555555555"
+        # A worker inherits the requesting conversation's recorded profile.
+        assert payload["agent_profile_id"] == "parent-profile"
+        assert payload["tags"] == {"role": "worker", "spawnedby": parent}
+        assert payload["initial_message"]["content"][0]["text"] == "do it"
+        assert payload["title"] == "T"
+        assert "agent_launch_additions" not in payload
+        # Seeded *before* the create, so the container's first run sees the plugin.
+        assert hooks.plugin_dir(
+            root, "11111111222233334444555555555555"
+        ).is_dir()
+        assert entry["parent"] == parent
 
 
-def test_create_campaign_rejects_an_acp_profile() -> None:
+def test_worker_profile_precedence_request_then_config_then_active() -> None:
     with tempfile.TemporaryDirectory() as tmp:
         root = make_tree(Path(tmp))
-        client = FakeClient(profiles=[{"id": "base-profile", "agent_kind": "acp"}])
-        try:
-            spawner.create_campaign(
-                spawner_config(),
+        parent = "aa11bb22cc33dd44"
+        config = spawner.SpawnerConfig(
+            agent_server_url="http://x", session_key="k", agent_profile_id="cfg"
+        )
+        # The request wins.
+        assert (
+            spawner.resolve_agent_profile(
+                FakeAgentServer(),
                 root,
-                "Port the feature",
-                None,
-                "base-profile",
-                None,
-                client,
+                parent,
+                spawner.SpawnRequest(task="x", agent_profile_id="req"),
+                config,
             )
-        except spawner.SpawnerConfigError:
-            return
-        raise AssertionError("expected SpawnerConfigError for an ACP profile")
+            == "req"
+        )
+        # Then the config default.
+        assert (
+            spawner.resolve_agent_profile(
+                FakeAgentServer(), root, parent, spawner.SpawnRequest(task="x"), config
+            )
+            == "cfg"
+        )
+        # Then the Agent Server's active profile.
+        client = FakeAgentServer(
+            profiles={"profiles": [], "active_agent_profile_id": "active-1"}
+        )
+        empty = spawner.SpawnerConfig(agent_server_url="http://x", session_key="k")
+        assert (
+            spawner.resolve_agent_profile(
+                client, root, parent, spawner.SpawnRequest(task="x"), empty
+            )
+            == "active-1"
+        )
+
+
+def test_watcher_scan_creates_a_worker_then_is_idempotent() -> None:
+    with tempfile.TemporaryDirectory() as tmp:
+        root = make_tree(Path(tmp))
+        parent = "aa11bb22cc33dd44"
+        write_record(
+            root, parent, launched_agent_profile={"agent_profile_id": "p"}
+        )
+        path = write_spawn_request(root, parent, "request-1.json", task="do it")
+        config = spawner.SpawnerConfig(agent_server_url="http://x", session_key="k")
+        client = FakeAgentServer()
+        watcher = spawner.Watcher(
+            root,
+            config,
+            client=client,
+            reserve=lambda: "aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee",
+        )
+        created = watcher.scan_once()
+        assert created == ["aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee"]
+        assert len(client.payloads) == 1
+        # The request was moved aside and the link records the worker.
+        assert not path.exists()
+        assert (spawner.spawn_dir(root, parent) / spawner.DONE_DIR / path.name).is_file()
+        assert spawner.status(root, parent)["workers"][0]["id"] == created[0]
+        # Nothing left to do, and no second create.
+        assert watcher.scan_once() == []
+        assert len(client.payloads) == 1
+
+
+def test_watcher_retries_then_sets_a_failing_request_aside() -> None:
+    with tempfile.TemporaryDirectory() as tmp:
+        root = make_tree(Path(tmp))
+        parent = "aa11bb22cc33dd44"
+        write_record(
+            root, parent, launched_agent_profile={"agent_profile_id": "p"}
+        )
+        path = write_spawn_request(root, parent, "request-1.json", task="do it")
+        config = spawner.SpawnerConfig(agent_server_url="http://x", session_key="k")
+        watcher = spawner.Watcher(
+            root, config, client=FakeAgentServer(error=OSError("boom"))
+        )
+        for _ in range(spawner.MAX_ATTEMPTS - 1):
+            watcher.scan_once()
+        assert path.exists()  # still retrying
+        assert spawner.status(root, parent)["last_error"] == "boom"
+        watcher.scan_once()  # the final attempt sets it aside
+        assert not path.exists()
+        assert (spawner.spawn_dir(root, parent) / spawner.DONE_DIR / path.name).is_file()
+
+
+def test_watcher_sets_a_malformed_request_aside() -> None:
+    with tempfile.TemporaryDirectory() as tmp:
+        root = make_tree(Path(tmp))
+        parent = "aa11bb22cc33dd44"
+        path = write_spawn_request(root, parent, "request-1.json", title="no task")
+        watcher = spawner.Watcher(
+            root,
+            spawner.SpawnerConfig(agent_server_url="http://x", session_key="k"),
+            client=FakeAgentServer(),
+        )
+        for _ in range(spawner.MAX_ATTEMPTS):
+            watcher.scan_once()
+        assert not path.exists()
+        assert "invalid request" in spawner.status(root, parent)["last_error"]
+
+
+def test_state_reports_spawn_status_per_conversation() -> None:
+    with tempfile.TemporaryDirectory() as tmp:
+        root = make_tree(Path(tmp))
+        hex_id = "aa11bb22cc33dd44"
+        write_spawn_request(root, hex_id, "request-1.json", task="do it")
+        (spawner.spawn_dir(root, hex_id) / spawner.LINK_NAME).write_text(
+            json.dumps({"workers": [{"id": "w1"}]})
+        )
+        row = next(
+            entry for entry in state.state(root)["conversations"] if entry["id"] == hex_id
+        )
+        assert row["spawn"]["requested"] is True
+        assert row["spawn"]["workers"] == [{"id": "w1"}]
+        assert row["spawn"]["requests"][0]["task"] == "do it"
 
 
 def main() -> int:

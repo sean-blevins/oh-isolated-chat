@@ -26,6 +26,7 @@
   <button id="promote-all" class="primary">Promote all</button>
   <span class="status" id="status"></span>
 </div>
+<div class="bar"><span class="note" id="spawner"></span></div>
 
 <h2>New conversation</h2>
 <div class="bar">
@@ -36,7 +37,9 @@
   <span class="note">Starts a conversation this app owns: it seeds the plugin into the
   conversation's runtime directory <em>before</em> creating it, so the container's first run
   already has it. The plugin carries a <code>handover</code> skill and a hook that logs to
-  <code>.openhands/handover/hook.log</code>, counts runs, and detects a handover request.
+  <code>.openhands/handover/hook.log</code>, counts runs, and detects a handover request, plus a
+  <code>spawn</code> skill: the agent writes a request to <code>.openhands/spawn/</code> and the
+  backend's watcher starts a new top-level conversation for it, with no page open.
   The conversation launches on the chosen agent profile, with the chosen LLM profile
   overriding the profile's own — the same path Canvas's own launcher uses, so the
   credentials are resolved by the Agent Server and never handled here.</span>
@@ -45,25 +48,6 @@
   <label class="note"><input id="auto-handover" type="checkbox">
   Auto-hand-over when the hook requests one (confirms with the model first)</label>
 </div>
-
-<h2>Background orchestrator</h2>
-<div class="bar">
-  <input id="campaign-message" type="text" size="40" placeholder="Campaign goal…">
-  <select id="campaign-agent-profile" title="Agent profile each worker this campaign spawns launches on"></select>
-  <select id="campaign-llm" title="LLM profile the workers run on"></select>
-  <button id="new-campaign" class="primary">Start campaign</button>
-  <span class="note" id="spawner-note"></span>
-</div>
-<p class="note">
-  A campaign is a root orchestrator conversation whose agent can start worker
-  conversations on its own, in the background, with no page open. Pick the agent
-  profile (and, for an OpenHands profile, the LLM profile) each worker should use;
-  the backend bakes both into the campaign, so every worker it spawns inherits
-  them. Background spawns work out of the box: the backend discovers the Agent
-  Server URL and session key from its parent process. An optional
-  <code>spawner.json</code> in the backend data dir only overrides an exotic
-  deployment.
-</p>
 
 <h2>Conversations</h2>
 <table>

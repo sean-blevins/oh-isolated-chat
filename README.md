@@ -13,13 +13,12 @@ Four actions today:
 - **Fork** — copy a conversation's full history and state into a new
   conversation (ISO-08), on the source's LLM profile or on another one picked
   per row.
-- **Start a campaign** — a root orchestrator conversation whose agent can spawn
-  worker conversations **in the background**, with no page open (see *Agent
-  triggered spawns*). Works out of the box: the backend discovers what it needs
-  from the Agent Server process, and you pick each campaign's agent profile in
-  the page.
 - **Clear the durable store** — debug only, and removed before any release: drop
   everything promoted so far, so a new conversation starts with no memory.
+
+A fifth runs without any page: a conversation's agent can **spawn** another
+top-level conversation by writing a request file into its workspace; a backend
+watcher picks it up and creates the conversation. See *Background spawns* below.
 
 ## Why an app
 
@@ -209,112 +208,58 @@ button per row, enabled once the hook has requested one or an artifact exists. A
 > `stop` hook can deny the stop and point the agent at the skill). See `plan.md`
 > feature 9.
 
-## Agent-triggered spawns (background orchestrator)
+## Background spawns
 
-A conversation can start another conversation. The platform primitive is the
-`start_child_conversation` tool: it POSTs a `StartChildConversationRequest`
-(`task`, `title`, `isolation`) to a `launch_url`. In a Docker deployment the
-tool's *default* URL is the in-container `/api/conversations/{parent}/children`,
-which cannot create a sibling conversation — the child would land in the parent
-container's namespace (`Errno 13 Permission denied`). So the worker model here
-creates **top-level** conversations instead:
+A conversation's agent can start **another top-level conversation** — a
+*worker* — and the spawn needs **no browser page open**. The mechanism uses the
+one channel a container shares with the host: its workspace bind mount.
 
-- **Campaign** — a root orchestrator conversation. Long-running. Its agent owns
-  the plan and decomposes work.
-- **Worker** — a top-level conversation per epic/topic, created by this app's
-  spawn endpoint. It gets its own container and workspace, and is openable in
-  Canvas like any other conversation.
+Why it is built this way: on a Docker deployment the agent's
+`start_child_conversation` tool executes **inside the conversation's own
+container** (each conversation runs its own agent-server there), so it can reach
+neither the container's loopback nor `host.docker.internal` — the host backend is
+not on any path the container can route to. So the container does not call the
+backend; it leaves a file, and the backend does the API call.
 
-The tree is reconstructed from tags, not `parent_conversation_id`:
+The three parts:
 
-| Tag | On | Meaning |
-| --- | --- | --- |
-| `role=orchestrator` | campaign root | the root of a tree |
-| `role=worker` | worker | spawned by a campaign |
-| `campaign=<hex>` | both | which campaign a conversation belongs to |
-| `spawnedby=<hex>` | worker | the campaign that spawned it |
+1. **The skill.** The seeded plugin contributes a `spawn` skill (alongside
+   `handover`). It tells the agent to write
+   `.openhands/spawn/request-<id>.json` — `{task, title?, profile?, llm?}` — into
+   its workspace, atomically, and then carry on. The container cannot do more
+   than ask; the skill is content, not mechanics.
+2. **The watcher.** The backend runs a background thread that polls
+   `runtime-data/*/workspace/.openhands/spawn/` every couple of seconds. When it
+   finds a request it reserves an id, **seeds the plugin into the new runtime
+   directory before the create** (so the worker's first run already has the hook
+   and both skills), and creates a **top-level** conversation through the Agent
+   Server API, with `initial_message = task` so the worker starts immediately.
+3. **The create is host-side.** The backend is a child of the Agent Server
+   process, so it discovers the Agent Server's listen address and session key
+   from that parent (`/proc/<ppid>/environ` and its `--host`/`--port` argv), with
+   an optional `<data-dir>/spawner.json` override. This is the seam
+   `export_session_api_key` documents: the Agent Server holds its session key in
+   its own environment.
 
-### How it works, and why it needs no page
+A worker is **top-level**, not a native child: the Docker runtime creates each
+conversation in its own container, and a parent link would fail (HTTP 422), so
+the link back travels as tags — `role=worker`, `spawnedby=<parent hex>` — and is
+also recorded in the parent's `.openhands/spawn/spawn.json`. A processed request
+is moved to `.openhands/spawn/done/`, so it is fulfilled exactly once. A request
+that fails is retried (a transport error may be transient) and set aside after a
+few attempts, with the last error written to `spawn.json` and shown on the row.
 
-The whole point is that a spawn runs **entirely in the background**. That needs
-the app backend to call the Agent Server itself, which by default it cannot: the
-managed backend is launched by the Agent Server but inherits none of its `OH_*`
-environment, and only the host page holds credentials.
+The page shows the state per row (`spawn requested`, `spawned <id>`, or the last
+error) and a **Background spawns** line in the header reporting whether the
+watcher found Agent Server access and how many workers it has created
+(`GET /api/spawner`).
 
-Rather than make the operator hand-write config, the backend **discovers** what
-it needs from the machine it is already running on. The managed backend is a
-child of the Agent Server, so it reads the Agent Server's environment and argv at
-`/proc/<pid>/environ` and `/proc/<pid>/cmdline` (walking up its own ancestors):
-
-- the **session key**, from `OH_SESSION_API_KEY_PATH` (or
-  `OH_SESSION_API_KEYS_0`), falling back to
-  `<persistence>/agent-canvas/api-key.txt` on disk;
-- the **Agent Server URL**, from the server's `--host`/`--port` argv, falling
-  back to `OH_APP_BACKEND_PUBLIC_URL`.
-
-If neither the process walk nor the on-disk key yields a session key, the feature
-stays off and the page says so.
-
-A `spawner.json` in the backend data dir is **optional**; it only overrides an
-exotic deployment (a custom public base URL, a fixed port, a distinct key):
-
-```json
-{
-  "public_base_url": "https://apps.example/lit",
-  "listen_port": 59777,
-  "session_key": "<override the discovered key>"
-}
-```
-
-Place it at **`<data-dir>/spawner.json`**, where `<data-dir>` is the managed
-backend's data directory (the app page's *Background orchestrator* status shows
-the exact path and whether the config was discovered or read from a file).
-`session_key_path` may be used instead of `session_key`. `listen_port` should be
-stable, because it is baked into the launch URL.
-
-The default `public_base_url` is the **Agent Server's own host with this
-listener's port** — normally `http://127.0.0.1:<listen_port>`. That is the right
-address because the `start_child_conversation` executor is an *in-process caller
-of the Agent Server* (upstream `export_session_api_key` names it as such), and
-the backend is a child of that process, so the tool reaches the endpoint over the
-same loopback the tool's default launcher uses. `host.docker.internal` is **not**
-that address: from the Agent Server's namespace it can resolve to the Docker
-gateway (`172.17.0.1`), where nothing listens, and the tool's connect is refused.
-Set `public_base_url` only when the tool reaches the endpoint by a different name
-(a fixed ingress, or a deployment where the endpoint really is elsewhere).
-
-With config resolved, the backend:
-
-1. Starts a second HTTP listener (the **spawn endpoint**) bound to `0.0.0.0`, so
-   it is reachable on the Agent Server's loopback (where the tool runs) and on any
-   container path a deployment might add.
-2. On **Start campaign**, takes the agent profile (and, for OpenHands, the LLM
-   profile) you chose in the page, creates a dedicated orchestrator profile for
-   the campaign — the user's normal tools plus `start_child_conversation` bound
-   to `…/api/spawn?campaign=<id>&profile=<agent>&llm=<llm>` — and starts a
-   top-level conversation on it. **One profile is created per campaign**, so each
-   campaign can run workers on a different base agent profile.
-3. When that agent calls the tool, the tool POSTs to the spawn endpoint from the
-   Agent Server process. The backend reserves an id, seeds the hook plugin, and
-   creates a **top-level worker** with `initial_message = task`, so the worker
-   starts running inside the create call. No browser page is involved, and no page
-   needs to be open.
-
-Because the request body carries no parent id, the campaign and the worker's
-agent profile travel in the launch URL as query tokens — which is what the
-per-campaign profile is for.
-
-### POC shortcuts to revisit
-
-- **One agent profile per campaign.** The launch URL is minted per campaign, so
-  each campaign consumes an agent-profile slot (the server caps these at 50).
-  The alternative is a single shared orchestrator profile whose parent is
-  recovered from the per-conversation session key the container sends (the
-  backend would decrypt `runtime-control/<hex>.json` with `OH_SECRET_KEY`).
-  Deferred.
-- **Non-Linux hosts.** Discovery reads `/proc`, so it is Linux-only by design
-  (the deployment is). A non-Linux host needs the optional `spawner.json`. A
-  sidecar capability is deferred to the POC follow-up list.
+> **Open item.** The watcher needs the backend to actually be running (it is a
+> managed backend: Canvas starts it the first time the page is opened) and to
+> discover Agent Server access. Discovery is verified against the local dev
+> stack; on a deployment it must be checked, and `spawner.json` is the override
+> when discovery cannot find the credentials. If the header says *off*, no
+> credentials were discovered and no spawn will be fulfilled.
 
 ## Names and tags
 
@@ -369,27 +314,25 @@ src/isolated_chat_backend/  the host process: stdlib-only Python package
   profiles.py            agent profiles and the durable memory key they own
   memory.py              the promotion line union
   hooks.py               the seed plugin: manifest, hooks, the cheap gate
-                         script, and the handover skill, written into a new
-                         conversation's runtime dir before it starts
+                         script, and the handover + spawn skills, written into a
+                         new conversation's runtime dir before it starts
   handover.py            host-side handover: read the cheap request, optional
                          model judgement, build the artifact, seed the successor
-  spawner.py             the background spawner: config discovery (Agent Server
-                         process walk + on-disk key, optional spawner.json
-                         override), the Agent Server client, worker creation,
-                         the campaign root, and the container-reachable spawn
-                         endpoint
-  state.py               the /api/state payload (handover state + the flags that
-                         say whether Canvas lists a row) and the debug clear
-  server.py              HTTP routing (GET /health, /api/state, /api/spawner, /,
-                         assets; POST /api/seed, /api/handover, /api/campaign,
-                         /api/promote, /api/delete, /api/clear) and the spawn
-                         listener (SpawnHandler)
-  __main__.py            argv parsing, store discovery, spawner startup, serve loop
+  spawner.py             the background spawner: discover Agent Server access
+                         from the parent process and a file-watcher that turns a
+                         conversation's spawn request into a top-level worker
+  state.py               the /api/state payload (handover + spawn state, and the
+                         flags that say whether Canvas lists a row) and the
+                         debug clear
+  server.py              HTTP routing (GET /health, /api/state, /api/spawner,
+                         /, assets; POST /api/seed, /api/handover, /api/promote,
+                         /api/delete, /api/clear)
+  __main__.py            argv parsing, store discovery, the spawner thread, serve
   web/                   the backend view served to the iframe:
                          index.html, app.css, app.js
 backend/linux-amd64.tar.gz  built artifact (bin/ + lib/); digest pinned in the manifest
 scripts/build-backend.sh builds the artifact and rewrites the pinned digest
-tests/test_isolated_chat_backend.py  unit tests for the union, path resolution, the hook seed, and handover
+tests/test_isolated_chat_backend.py  unit tests for the union, path resolution, the hook seed, handover, and the spawner
 docs/conversation-isolation-gaps.md  the original gap inventory (ISO-nn)
 ```
 
@@ -415,7 +358,7 @@ bridge (`canvas_app_backend_bridge_v1`, released in Agent Server 1.56.0) and
 | Action  | Needs                                                                                                                              |
 | ------- | ---------------------------------------------------------------------------------------------------------------------------------- |
 | Start   | The Canvas App backend bridge, a Docker-runtime Agent Server, and a persisted `settings.json` with `agent_settings` to launch from. |
-| Start campaign | Nothing to configure: the backend discovers the Agent Server URL and session key from its parent process (with an optional `spawner.json` override). The spawn endpoint is reached over the Agent Server's own loopback, so no container networking is involved. |
+| Spawn   | The managed backend running with Agent Server access (discovered from its parent process, or set in `spawner.json`). No page open at spawn time. |
 | Promote | Nothing server-side to run it — it reads the conversation's files and writes the host store. Its **effect** (a new isolated conversation starting from the promoted memory) needs an Agent Server that seeds the durable store at container build. |
 | Fork    | Agent Server with the host-side Docker fork route; a stock release answers `501`.                                                   |
 
@@ -500,8 +443,15 @@ must accept it once. The durable fix is a certificate the browser already trusts
   reach it until that CA is present in the image or injected — the Agent Server
   forwards only a fixed env allowlist and mounts only the conversation
   directories, so there is no host-side knob for this today.
-- Background spawns are discovered from the Agent Server process (`/proc`), so
-  they are Linux-only by default; a non-Linux host needs the optional
-  `spawner.json` with the Agent Server URL and session key. Each campaign
-  consumes one agent-profile slot (the launch URL is per campaign), and the
-  spawn listener is reached over the Agent Server's own loopback.
+- Background spawns are polled (a couple of seconds), so a worker appears
+  shortly after the request is written, not instantly. A worker inherits the
+  requesting conversation's agent profile unless the request or `spawner.json`
+  names another, and `initial_message` makes it start its first turn immediately.
+- The spawner discovers Agent Server access from its parent process (`/proc`), so
+  it is Linux-only by default; a non-Linux host needs `spawner.json` with the
+  Agent Server URL and session key. It requires the managed backend to be running
+  (Canvas starts it the first time the page is opened); if the header says the
+  spawner is off, no credentials were discovered.
+- A spawn request is a plain file in the conversation's workspace, so anything
+  inside the container can write one — treat the workspace as trusted input, the
+  same as the handover request.

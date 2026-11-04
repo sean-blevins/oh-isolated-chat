@@ -21,6 +21,10 @@ The plugin is the app's standing policy for every conversation it starts:
 
 * ``skills/handover/SKILL.md`` -- tells the agent how to *produce* a handover
   (write ``.openhands/handover/handover.md``, no carried context, link back).
+* ``skills/spawn/SKILL.md`` -- tells the agent how to *request* a new top-level
+  conversation: write ``.openhands/spawn/request-<id>.json``. The host-side
+  watcher (``spawner.py``) fulfils it, because a container cannot reach the
+  Agent Server. Both skills are content only; the mechanics are host-side.
 * ``bin/hook.sh`` -- the cheap, deterministic first stage of detection. It runs
   on every ``Stop`` (and on ``UserPromptSubmit`` to catch a trigger word), keeps
   a run counter and a marker in the workspace, and writes a *request* only when
@@ -43,11 +47,17 @@ SEED_PLUGIN_NAME = "handover-hook"
 
 # The AgentSkills-format skill the plugin contributes.
 SKILL_NAME = "handover"
+# A second skill: it teaches the agent to *request* a spawned conversation. The
+# host-side watcher (``spawner.py``) is the only thing that can create one, so
+# this, like the handover skill, is content -- it writes a request file into the
+# workspace the host shares.
+SPAWN_SKILL_NAME = "spawn"
 
 # Where the hook script lives inside the plugin. The command refers to it through
 # ``$HOME`` because the plugin directory is mounted at ``$HOME/plugins/<name>``.
 BIN_REL = Path("bin") / "hook.sh"
 SKILL_REL = Path("skills") / SKILL_NAME / "SKILL.md"
+SPAWN_SKILL_REL = Path("skills") / SPAWN_SKILL_NAME / "SKILL.md"
 
 MANIFEST = {
     "name": SEED_PLUGIN_NAME,
@@ -150,6 +160,55 @@ Include:
 Do **not** paste long logs or file contents; link to paths instead.
 """
 
+# The spawn skill. Like the handover skill it is content, not mechanics: the
+# container has no Agent Server credentials, so it can only *ask* the host to
+# start a conversation. It writes a request file into the workspace the host
+# shares; the host-side watcher does the create.
+_SPAWN_SKILL = """\
+---
+name: spawn
+description: Start a separate top-level conversation to work on a task in parallel. Use when the user asks to spawn or delegate a sub-conversation, or when a task is self-contained enough to run on its own.
+---
+
+# Spawn a helper conversation
+
+A spawn starts a **new, separate, top-level conversation**. It gets its own
+workspace and runs on its own; it does **not** inherit this conversation's
+context, so the task you hand it must be self-contained. The host starts it in
+the background -- nothing here waits for it, and no browser page needs to be
+open.
+
+## What to do
+
+Write one request file per spawn to `.openhands/spawn/request-<id>.json` in your
+workspace, then carry on. Write it atomically so the host never reads a
+half-written file, and use a unique name (`$$` is this shell's pid):
+
+```sh
+mkdir -p .openhands/spawn
+cat > .openhands/spawn/request-$$.json.tmp <<'JSON'
+{"task": "<self-contained brief>", "title": "<short title>"}
+JSON
+mv .openhands/spawn/request-$$.json.tmp .openhands/spawn/request-$$.json
+```
+
+Fields:
+
+- **task** (required) -- the full, self-contained brief. The new conversation
+  starts with exactly this as its first message and nothing else.
+- **title** (optional) -- a short label for the new conversation.
+- **profile** (optional) -- an agent profile id to launch it on. Omit to inherit
+  this conversation's profile.
+- **llm** (optional) -- an LLM profile to run it on. Omit to inherit.
+
+The host picks the file up within a few seconds, moves it aside, and records the
+new conversation's id in `.openhands/spawn/spawn.json`. If a request is
+malformed, the host records the error there instead and retries, then sets the
+file aside after a few attempts.
+
+Do **not** wait for the spawn: tell the user it was requested and continue.
+"""
+
 
 def hooks_config() -> dict:
     """The hook policy the seeded plugin contributes.
@@ -193,9 +252,10 @@ def seed(root: Path, hex_id: str) -> Path:
     script.parent.mkdir(parents=True, exist_ok=True)
     script.write_text(_HOOK_SCRIPT)
     script.chmod(script.stat().st_mode | 0o111)
-    skill = plugin / SKILL_REL
-    skill.parent.mkdir(parents=True, exist_ok=True)
-    skill.write_text(_SKILL)
+    for rel, text in ((SKILL_REL, _SKILL), (SPAWN_SKILL_REL, _SPAWN_SKILL)):
+        skill = plugin / rel
+        skill.parent.mkdir(parents=True, exist_ok=True)
+        skill.write_text(text)
     return plugin
 
 
