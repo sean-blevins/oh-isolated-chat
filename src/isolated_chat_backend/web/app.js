@@ -69,7 +69,10 @@ const canHandOver = (convo) =>
   Boolean(convo.handover && (convo.handover.requested || convo.handover.doc));
 
 // Spawn state for a row: a request the agent left for the watcher, the workers
-// the backend created from it, and any last error.
+// the backend created from it (with their goal/run status), and any last error.
+// A finished worker is only "ok" for a genuine success; a capped goal, an
+// interrupted one, or a worker the host could not start is a warning.
+const spawnSuccess = new Set(["complete", "finished", "done"]);
 const spawnChips = (convo) => {
   const s = convo.spawn ?? {};
   const parts = [];
@@ -78,7 +81,17 @@ const spawnChips = (convo) => {
   }
   for (const worker of s.workers ?? []) {
     const id = short(worker.conversation_id || worker.id || "");
-    parts.push(`<span class="chip">spawned ${escapeHtml(id)}</span>`);
+    const status = String(worker.status ?? "running");
+    const label = worker.goal ? `goal ${status}` : `${status}`;
+    const kind = worker.done
+      ? spawnSuccess.has(status)
+        ? "chip ok"
+        : "chip warn"
+      : "chip";
+    const notified = worker.done && worker.notified === false ? " · parent not told" : "";
+    parts.push(
+      `<span class="${kind}">spawned ${escapeHtml(id)} · ${escapeHtml(label)}${notified}</span>`,
+    );
   }
   if (s.last_error) {
     parts.push(`<span class="chip warn">spawn error: ${escapeHtml(s.last_error)}</span>`);
@@ -232,7 +245,10 @@ async function loadSpawner() {
     const status = await response.json();
     $("spawner").textContent = status.enabled
       ? `Background spawns: on — watching .openhands/spawn via `
-        + `${status.agent_server_url} (${status.spawned} spawned, ${status.errors} errors)`
+        + `${status.agent_server_url} (${status.spawned} spawned, `
+        + `${status.completed} done, ${status.errors} errors; `
+        + `${status.goal ? `goals ≤${status.max_iterations} rounds` : "goals off"}; `
+        + `${status.notify_parent ? "parent notified on done" : "parent not notified"})`
       : "Background spawns: off — no Agent Server credentials were discovered "
         + "(set spawner.json in the backend data dir to enable)";
   } catch {

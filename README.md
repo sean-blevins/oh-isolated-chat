@@ -18,7 +18,9 @@ Four actions today:
 
 A fifth runs without any page: a conversation's agent can **spawn** another
 top-level conversation by writing a request file into its workspace; a backend
-watcher picks it up and creates the conversation. See *Background spawns* below.
+watcher picks it up, starts the worker as an OpenHands **goal**, and posts the
+worker's result back into the spawning conversation when it finishes. See
+*Background spawns* below.
 
 ## Why an app
 
@@ -224,16 +226,17 @@ backend; it leaves a file, and the backend does the API call.
 The three parts:
 
 1. **The skill.** The seeded plugin contributes a `spawn` skill (alongside
-   `handover`). It tells the agent to write
-   `.openhands/spawn/request-<id>.json` — `{task, title?, profile?, llm?}` — into
-   its workspace, atomically, and then carry on. The container cannot do more
-   than ask; the skill is content, not mechanics.
+   `handover` and `done`). It tells the agent to write
+   `.openhands/spawn/request-<id>.json` —
+   `{task, title?, profile?, llm?, goal?, max_iterations?}` — into its workspace,
+   atomically, and then carry on. The container cannot do more than ask; the
+   skill is content, not mechanics.
 2. **The watcher.** The backend runs a background thread that polls
    `runtime-data/*/workspace/.openhands/spawn/` every couple of seconds. When it
    finds a request it reserves an id, **seeds the plugin into the new runtime
    directory before the create** (so the worker's first run already has the hook
-   and both skills), and creates a **top-level** conversation through the Agent
-   Server API, with `initial_message = task` so the worker starts immediately.
+   and all three skills), and creates a **top-level** conversation through the
+   Agent Server API, tagged `role=worker` / `spawnedby=<parent hex>`.
 3. **The create is host-side.** The backend is a child of the Agent Server
    process, so it discovers the Agent Server's listen address and session key
    from that parent (`/proc/<ppid>/environ` and its `--host`/`--port` argv), with
@@ -249,10 +252,55 @@ is moved to `.openhands/spawn/done/`, so it is fulfilled exactly once. A request
 that fails is retried (a transport error may be transient) and set aside after a
 few attempts, with the last error written to `spawn.json` and shown on the row.
 
-The page shows the state per row (`spawn requested`, `spawned <id>`, or the last
-error) and a **Background spawns** line in the header reporting whether the
-watcher found Agent Server access and how many workers it has created
-(`GET /api/spawner`).
+### Workers run as goals
+
+By default a worker is created **idle** and then given a goal:
+
+```
+POST /api/conversations            # idle: no initial_message
+POST /api/conversations/{id}/goal  # {objective: <task>, max_iterations}
+```
+
+The goal is not a separate conversation or history: the agent-server runs the
+agent for the same conversation and a **judge LLM** audits progress after each
+round, publishing a terminal status of `complete` / `capped` / `interrupted`.
+That is a real "confirmed done", not merely "the run went idle". A request can
+opt out with `"goal": false` (the task is then sent as a single opening message)
+or set `"max_iterations"` (default `10`). If the Agent Server has no `/goal`
+route, the spawn falls back to a normal run and records why on the link.
+
+The create must stay idle because `/goal` answers `409` while a conversation is
+already running — so the two calls cannot be collapsed into one.
+
+### Done detection and the parent
+
+The watcher polls each unfinished worker (every 10 s by default) and treats it
+done when:
+
+- the goal publishes a terminal status (`complete` / `capped` / `interrupted`);
+  or
+- the worker writes its own `.openhands/spawn/done.json`
+  (`{status, summary?, verdict?, final?}`) — the seeded `done` skill tells it to;
+  or
+- without a goal, the conversation's `execution_status` is terminal
+  (`finished` / `error` / `stuck` / `stopped`).
+
+On done it reads the agent's final answer (`GET /{id}/agent_final_response`) and
+**posts a message into the parent** (`POST /{parent}/events`) with the worker's
+id, status, verdict, summary, and final answer — so the requesting conversation
+learns the result with no page open. The message does not start a parent run by
+default (`notify_run` opts in). A failed notification is retried on the next
+poll; the worker is never reported twice.
+
+Archive is deliberately **not** implemented: there is no archive HTTP endpoint
+(the Docker runtime archives internally, but only the idle reclaimer calls it).
+The closest public primitive is `DELETE /api/conversations/{id}/runtime`, which
+stops the container while keeping its history and workspace, and is deferred.
+
+The page shows the state per row (`spawn requested`, `spawned <id> · goal
+running`, `spawned <id> · goal complete`, or the last error) and a **Background
+spawns** line in the header reporting whether the watcher found Agent Server
+access and how many workers it has created and completed (`GET /api/spawner`).
 
 > **Open item.** The watcher needs the backend to actually be running (it is a
 > managed backend: Canvas starts it the first time the page is opened) and to
@@ -314,13 +362,15 @@ src/isolated_chat_backend/  the host process: stdlib-only Python package
   profiles.py            agent profiles and the durable memory key they own
   memory.py              the promotion line union
   hooks.py               the seed plugin: manifest, hooks, the cheap gate
-                         script, and the handover + spawn skills, written into a
-                         new conversation's runtime dir before it starts
+                         script, and the handover + spawn + done skills, written
+                         into a new conversation's runtime dir before it starts
   handover.py            host-side handover: read the cheap request, optional
                          model judgement, build the artifact, seed the successor
   spawner.py             the background spawner: discover Agent Server access
-                         from the parent process and a file-watcher that turns a
+                         from the parent process, a file-watcher that turns a
                          conversation's spawn request into a top-level worker
+                         running as a goal, and the completion poll that posts
+                         the worker's result back into the parent
   state.py               the /api/state payload (handover + spawn state, and the
                          flags that say whether Canvas lists a row) and the
                          debug clear
@@ -332,7 +382,7 @@ src/isolated_chat_backend/  the host process: stdlib-only Python package
                          index.html, app.css, app.js
 backend/linux-amd64.tar.gz  built artifact (bin/ + lib/); digest pinned in the manifest
 scripts/build-backend.sh builds the artifact and rewrites the pinned digest
-tests/test_isolated_chat_backend.py  unit tests for the union, path resolution, the hook seed, handover, and the spawner
+tests/test_isolated_chat_backend.py  unit tests for the union, path resolution, the hook seed, handover, and the spawner (goal, completion, parent notify)
 docs/conversation-isolation-gaps.md  the original gap inventory (ISO-nn)
 ```
 
@@ -358,7 +408,7 @@ bridge (`canvas_app_backend_bridge_v1`, released in Agent Server 1.56.0) and
 | Action  | Needs                                                                                                                              |
 | ------- | ---------------------------------------------------------------------------------------------------------------------------------- |
 | Start   | The Canvas App backend bridge, a Docker-runtime Agent Server, and a persisted `settings.json` with `agent_settings` to launch from. |
-| Spawn   | The managed backend running with Agent Server access (discovered from its parent process, or set in `spawner.json`). No page open at spawn time. |
+| Spawn   | The managed backend running with Agent Server access (discovered from its parent process, or set in `spawner.json`). No page open at spawn time. Worker goals need `POST /{id}/goal`; without it the task falls back to a normal run. |
 | Promote | Nothing server-side to run it — it reads the conversation's files and writes the host store. Its **effect** (a new isolated conversation starting from the promoted memory) needs an Agent Server that seeds the durable store at container build. |
 | Fork    | Agent Server with the host-side Docker fork route; a stock release answers `501`.                                                   |
 
@@ -444,9 +494,21 @@ must accept it once. The durable fix is a certificate the browser already trusts
   forwards only a fixed env allowlist and mounts only the conversation
   directories, so there is no host-side knob for this today.
 - Background spawns are polled (a couple of seconds), so a worker appears
-  shortly after the request is written, not instantly. A worker inherits the
-  requesting conversation's agent profile unless the request or `spawner.json`
-  names another, and `initial_message` makes it start its first turn immediately.
+  shortly after the request is written, not instantly, and completion is polled
+  more slowly (10 s by default). A worker inherits the requesting conversation's
+  agent profile unless the request or `spawner.json` names another. By default it
+  runs as an OpenHands **goal** (`max_iterations` 10 unless overridden); the
+  request can opt out with `"goal": false`.
+- A goal worker is created idle and its goal started in a second call, so there
+  is a brief window where it exists but has not begun. If `/goal` is refused the
+  task falls back to a normal run; the reason is recorded on the link.
+- Completion posts a message into the parent but does **not** start a parent run
+  unless `notify_run` is set. A worker that never emits a goal status and never
+  writes `done.json` is detected from its persisted `execution_status`, which the
+  host catalog reconciles from disk and can lag slightly.
+- **Archive on done is not implemented.** There is no archive HTTP endpoint; the
+  closest is `DELETE /api/conversations/{id}/runtime` (stop the container, keep
+  its history and workspace), deferred.
 - The spawner discovers Agent Server access from its parent process (`/proc`), so
   it is Linux-only by default; a non-Linux host needs `spawner.json` with the
   Agent Server URL and session key. It requires the managed backend to be running

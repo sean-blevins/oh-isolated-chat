@@ -610,10 +610,26 @@ def test_parse_verdict_ignores_prose_and_needs_a_bool() -> None:
 class FakeAgentServer:
     """The bits of the Agent Server client the spawner uses, recorded in memory."""
 
-    def __init__(self, profiles: dict | None = None, error: Exception | None = None):
+    def __init__(
+        self,
+        profiles: dict | None = None,
+        error: Exception | None = None,
+        execution_status: str = "running",
+        goal_status: dict | None = None,
+        final: str = "",
+        goal_error: Exception | None = None,
+        message_error: Exception | None = None,
+    ):
         self.payloads: list[dict] = []
+        self.goals: list[tuple[str, str, int]] = []
+        self.messages: list[tuple[str, str, bool]] = []
         self._profiles = profiles or {"profiles": [], "active_agent_profile_id": None}
         self._error = error
+        self._execution_status = execution_status
+        self._goal_status = goal_status
+        self._final = final
+        self._goal_error = goal_error
+        self._message_error = message_error
 
     def list_agent_profiles(self) -> dict:
         return self._profiles
@@ -623,6 +639,27 @@ class FakeAgentServer:
             raise self._error
         self.payloads.append(payload)
         return {"id": payload["conversation_id"], "execution_status": "running"}
+
+    def start_goal(self, conversation_id: str, objective: str, max_iterations: int) -> dict:
+        if self._goal_error is not None:
+            raise self._goal_error
+        self.goals.append((conversation_id, objective, max_iterations))
+        return {}
+
+    def send_message(self, conversation_id: str, text: str, run: bool = False) -> dict:
+        if self._message_error is not None:
+            raise self._message_error
+        self.messages.append((conversation_id, text, run))
+        return {}
+
+    def get_conversation(self, conversation_id: str) -> dict:
+        return {"id": conversation_id, "execution_status": self._execution_status}
+
+    def latest_goal_status(self, conversation_id: str) -> dict | None:
+        return self._goal_status
+
+    def agent_final_response(self, conversation_id: str) -> dict:
+        return {"response": self._final}
 
 
 def write_spawn_request(root: Path, hex_id: str, name: str, **fields: object) -> Path:
@@ -682,7 +719,30 @@ def test_config_from_dict_validates_and_defaults() -> None:
     assert config.agent_server_url == "http://127.0.0.1:8000"
     assert config.session_key == "k"
     assert config.poll_interval == spawner.DEFAULT_POLL_INTERVAL
-    for bad in ({}, {"agent_server_url": "http://x", "poll_interval": 0}):
+    assert config.max_iterations == spawner.DEFAULT_MAX_ITERATIONS
+    assert config.goal is True
+    assert config.notify_parent is True
+    assert config.notify_run is False
+    tuned = spawner.config_from_dict(
+        {
+            "agent_server_url": "http://x",
+            "goal": False,
+            "max_iterations": 4,
+            "notify_parent": False,
+            "notify_run": True,
+            "completion_interval": 30,
+        }
+    )
+    assert tuned.goal is False and tuned.max_iterations == 4
+    assert tuned.notify_parent is False and tuned.notify_run is True
+    assert tuned.completion_interval == 30
+    for bad in (
+        {},
+        {"agent_server_url": "http://x", "poll_interval": 0},
+        {"agent_server_url": "http://x", "max_iterations": 0},
+        {"agent_server_url": "http://x", "goal": "yes"},
+        {"agent_server_url": "http://x", "completion_interval": -1},
+    ):
         try:
             spawner.config_from_dict(bad)
         except spawner.SpawnerConfigError:
@@ -746,7 +806,7 @@ def test_find_requests_skips_the_link_record() -> None:
         ]
 
 
-def test_spawn_worker_seeds_and_creates_a_top_level_worker() -> None:
+def test_spawn_worker_seeds_creates_and_starts_a_goal() -> None:
     with tempfile.TemporaryDirectory() as tmp:
         root = make_tree(Path(tmp))
         parent = "aa11bb22cc33dd44"
@@ -771,14 +831,96 @@ def test_spawn_worker_seeds_and_creates_a_top_level_worker() -> None:
         # A worker inherits the requesting conversation's recorded profile.
         assert payload["agent_profile_id"] == "parent-profile"
         assert payload["tags"] == {"role": "worker", "spawnedby": parent}
-        assert payload["initial_message"]["content"][0]["text"] == "do it"
+        # A goal worker is created idle (the goal is a second call), because
+        # /goal is refused while the conversation is already running.
+        assert "initial_message" not in payload
         assert payload["title"] == "T"
         assert "agent_launch_additions" not in payload
-        # Seeded *before* the create, so the container's first run sees the plugin.
+        assert client.goals == [
+            ("11111111-2222-3333-4444-555555555555", "do it", 10)
+        ]
+        # Seeded *before* the create, so the worker's own first run sees the plugin.
         assert hooks.plugin_dir(
             root, "11111111222233334444555555555555"
         ).is_dir()
         assert entry["parent"] == parent
+        assert entry["goal"] is True and entry["done"] is False
+
+
+def test_spawn_worker_can_opt_out_of_goal() -> None:
+    with tempfile.TemporaryDirectory() as tmp:
+        root = make_tree(Path(tmp))
+        parent = "aa11bb22cc33dd44"
+        write_record(root, parent, launched_agent_profile={"agent_profile_id": "p"})
+        config = spawner.SpawnerConfig(agent_server_url="http://x", session_key="k")
+        client = FakeAgentServer()
+        request = spawner.SpawnRequest(task="do it", goal=False)
+        entry = spawner.spawn_worker(
+            root,
+            parent,
+            request,
+            config,
+            client,
+            reserve=lambda: "11111111-2222-3333-4444-555555555555",
+        )
+        # No goal: the create itself starts the run with the task as a message.
+        assert client.goals == []
+        assert client.payloads[0]["initial_message"]["content"][0]["text"] == "do it"
+        assert entry["goal"] is False
+
+
+def test_spawn_worker_falls_back_when_the_goal_cannot_start() -> None:
+    with tempfile.TemporaryDirectory() as tmp:
+        root = make_tree(Path(tmp))
+        parent = "aa11bb22cc33dd44"
+        write_record(root, parent, launched_agent_profile={"agent_profile_id": "p"})
+        config = spawner.SpawnerConfig(agent_server_url="http://x", session_key="k")
+        client = FakeAgentServer(goal_error=OSError("no /goal route"))
+        request = spawner.SpawnRequest(task="do it")
+        entry = spawner.spawn_worker(
+            root,
+            parent,
+            request,
+            config,
+            client,
+            reserve=lambda: "11111111-2222-3333-4444-555555555555",
+        )
+        # The task still runs, as a normal message, and the entry records why.
+        assert client.messages == [
+            ("11111111-2222-3333-4444-555555555555", "do it", True)
+        ]
+        assert entry["goal"] is False
+        assert "no /goal route" in entry["goal_error"]
+
+
+def test_spawn_worker_records_start_failed_without_raising() -> None:
+    # If the create succeeded but neither the goal nor the fallback message
+    # started, spawn_worker must NOT raise: the watcher would see the exception,
+    # retry the still-pending request, and create a *second* worker. It records
+    # the failure as a done entry instead, so the parent is told.
+    with tempfile.TemporaryDirectory() as tmp:
+        root = make_tree(Path(tmp))
+        parent = "aa11bb22cc33dd44"
+        write_record(root, parent, launched_agent_profile={"agent_profile_id": "p"})
+        config = spawner.SpawnerConfig(agent_server_url="http://x", session_key="k")
+        client = FakeAgentServer(
+            goal_error=OSError("no /goal route"),
+            message_error=OSError("no capacity"),
+        )
+        request = spawner.SpawnRequest(task="do it")
+        entry = spawner.spawn_worker(
+            root,
+            parent,
+            request,
+            config,
+            client,
+            reserve=lambda: "11111111-2222-3333-4444-555555555555",
+        )
+        assert entry["status"] == "start-failed"
+        assert entry["done"] is True
+        assert "no capacity" in entry["start_error"]
+        # The create still happened exactly once.
+        assert len(client.payloads) == 1
 
 
 def test_worker_profile_precedence_request_then_config_then_active() -> None:
@@ -882,6 +1024,305 @@ def test_watcher_sets_a_malformed_request_aside() -> None:
             watcher.scan_once()
         assert not path.exists()
         assert "invalid request" in spawner.status(root, parent)["last_error"]
+
+
+def test_parse_request_reads_goal_fields() -> None:
+    # Absent means "inherit the config": None, not False.
+    assert spawner.parse_request({"task": "x"}).goal is None
+    assert spawner.parse_request({"task": "x"}).max_iterations is None
+    request = spawner.parse_request(
+        {"task": "x", "goal": False, "max_iterations": 3}
+    )
+    assert request.goal is False
+    assert request.max_iterations == 3
+    for bad in ({"task": "x", "goal": "yes"}, {"task": "x", "max_iterations": 0}):
+        try:
+            spawner.parse_request(bad)
+        except ValueError:
+            pass
+        else:
+            raise AssertionError(f"expected ValueError for {bad!r}")
+
+
+def test_find_requests_skips_the_link_and_done_files() -> None:
+    with tempfile.TemporaryDirectory() as tmp:
+        root = make_tree(Path(tmp))
+        hex_id = "aa11bb22cc33dd44"
+        write_spawn_request(root, hex_id, "request-1.json", task="one")
+        directory = spawner.spawn_dir(root, hex_id)
+        (directory / spawner.LINK_NAME).write_text("{}")
+        # A worker's own completion summary is not a spawn request.
+        (directory / spawner.DONE_NAME).write_text('{"status": "done"}')
+        found = spawner.find_requests(root)
+        assert [(entry[0], entry[1].name) for entry in found] == [
+            (hex_id, "request-1.json")
+        ]
+
+
+def test_seed_contributes_the_done_skill() -> None:
+    with tempfile.TemporaryDirectory() as tmp:
+        root = make_tree(Path(tmp))
+        plugin = hooks.seed(root, "cc11dd22ee33ff44")
+        skill = plugin / hooks.DONE_SKILL_REL
+        assert skill.is_file()
+        text = skill.read_text()
+        assert text.startswith("---")
+        assert "name: done" in text
+        assert ".openhands/spawn/done.json" in text
+        assert "summary" in text
+
+
+def test_worker_completion_reads_a_terminal_goal() -> None:
+    with tempfile.TemporaryDirectory() as tmp:
+        root = make_tree(Path(tmp))
+        client = FakeAgentServer(
+            goal_status={
+                "active": False,
+                "status": "complete",
+                "iteration": 2,
+                "max_iterations": 10,
+                "objective": "do it",
+                "verdict": {"complete": True, "score": 1.0, "missing": ""},
+            },
+            final="the answer",
+        )
+        completion = spawner.worker_completion(root, "worker", client, goal=True)
+        assert completion["done"] is True
+        assert completion["source"] == "goal"
+        assert completion["status"] == "complete"
+        assert completion["final"] == "the answer"
+        assert completion["verdict"]["complete"] is True
+
+
+def test_worker_completion_waits_while_the_goal_runs() -> None:
+    with tempfile.TemporaryDirectory() as tmp:
+        root = make_tree(Path(tmp))
+        # Even a mechanical error does not end a goal: the loop continues past a
+        # stuck or errored round, so a running goal means "not done".
+        client = FakeAgentServer(
+            execution_status="error", goal_status={"status": "running"}
+        )
+        completion = spawner.worker_completion(root, "worker", client, goal=True)
+        assert completion == {"done": False, "status": "running"}
+
+
+def test_worker_completion_uses_execution_status_without_a_goal() -> None:
+    with tempfile.TemporaryDirectory() as tmp:
+        root = make_tree(Path(tmp))
+        client = FakeAgentServer(execution_status="finished", final="bye")
+        completion = spawner.worker_completion(root, "worker", client, goal=False)
+        assert completion["done"] is True
+        assert completion["source"] == "status"
+        assert completion["status"] == "finished"
+        assert completion["final"] == "bye"
+        assert spawner.worker_completion(
+            root, "worker", FakeAgentServer(execution_status="running"), goal=False
+        )["done"] is False
+
+
+def test_worker_completion_accepts_the_workers_own_done_file() -> None:
+    with tempfile.TemporaryDirectory() as tmp:
+        root = make_tree(Path(tmp))
+        worker = "bb11cc22dd33ee44"
+        path = spawner.worker_done_path(root, worker)
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(
+            json.dumps({"status": "blocked", "summary": "waiting on a review"})
+        )
+        completion = spawner.worker_completion(root, worker, FakeAgentServer(), goal=True)
+        assert completion["done"] is True
+        assert completion["source"] == "file"
+        assert completion["status"] == "blocked"
+        assert completion["summary"] == "waiting on a review"
+
+
+def test_completion_message_includes_status_verdict_and_final() -> None:
+    message = spawner.completion_message(
+        {
+            "id": "w1",
+            "conversation_id": "11111111-2222-3333-4444-555555555555",
+            "task": "do it",
+            "status": "capped",
+            "source": "goal",
+            "verdict": {"complete": False, "score": 0.4, "missing": "tests"},
+            "final": "not quite",
+        }
+    )
+    assert "11111111-2222-3333-4444-555555555555" in message
+    assert "capped" in message
+    assert "do it" in message
+    assert "complete=False" in message
+    assert "tests" in message
+    assert "not quite" in message
+
+
+def _spawn_one_worker(root: Path, parent: str, client, **config_fields):
+    write_record(root, parent, launched_agent_profile={"agent_profile_id": "p"})
+    write_spawn_request(root, parent, "request-1.json", task="do it")
+    config = spawner.SpawnerConfig(agent_server_url="http://x", session_key="k", **config_fields)
+    watcher = spawner.Watcher(
+        root,
+        config,
+        client=client,
+        reserve=lambda: "aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee",
+    )
+    watcher.scan_once()
+    return watcher
+
+
+def test_poll_workers_notifies_the_parent_once_done() -> None:
+    with tempfile.TemporaryDirectory() as tmp:
+        root = make_tree(Path(tmp))
+        parent = "aa11bb22cc33dd44"
+        client = FakeAgentServer(
+            goal_status={"status": "complete", "verdict": {"complete": True}},
+            final="all done",
+        )
+        watcher = _spawn_one_worker(root, parent, client)
+        done = watcher.poll_workers()
+        assert done == ["aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee"]
+        assert len(client.messages) == 1
+        target, text, run = client.messages[0]
+        assert target == spawner.dashed(parent)
+        assert run is False
+        assert "all done" in text and "complete" in text
+        entry = spawner.status(root, parent)["workers"][0]
+        assert entry["done"] is True
+        assert entry["notified"] is True
+        assert entry["status"] == "complete"
+        # Nothing to re-report: the parent is told exactly once.
+        assert watcher.poll_workers() == []
+        assert len(client.messages) == 1
+
+
+def test_poll_workers_skips_a_running_worker() -> None:
+    with tempfile.TemporaryDirectory() as tmp:
+        root = make_tree(Path(tmp))
+        parent = "aa11bb22cc33dd44"
+        client = FakeAgentServer(goal_status={"status": "running"})
+        watcher = _spawn_one_worker(root, parent, client)
+        assert watcher.poll_workers() == []
+        assert client.messages == []
+        assert spawner.status(root, parent)["pending_workers"] == 1
+
+
+def test_poll_workers_retries_a_failed_parent_notification() -> None:
+    with tempfile.TemporaryDirectory() as tmp:
+        root = make_tree(Path(tmp))
+        parent = "aa11bb22cc33dd44"
+        client = FakeAgentServer(
+            goal_status={"status": "complete"},
+            final="x",
+            message_error=OSError("parent unreachable"),
+        )
+        watcher = _spawn_one_worker(root, parent, client)
+        assert watcher.poll_workers() == ["aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee"]
+        entry = spawner.status(root, parent)["workers"][0]
+        assert entry["done"] is True and entry["notified"] is False
+        assert "parent unreachable" in entry["notify_error"]
+        # The worker is not re-counted, but the notification is retried.
+        client._message_error = None
+        assert watcher.poll_workers() == []
+        entry = spawner.status(root, parent)["workers"][0]
+        assert entry["notified"] is True
+        assert len(client.messages) == 1
+
+
+def test_poll_workers_can_disable_parent_notification() -> None:
+    with tempfile.TemporaryDirectory() as tmp:
+        root = make_tree(Path(tmp))
+        parent = "aa11bb22cc33dd44"
+        client = FakeAgentServer(goal_status={"status": "complete"}, final="x")
+        watcher = _spawn_one_worker(root, parent, client, notify_parent=False)
+        assert watcher.poll_workers() == ["aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee"]
+        assert client.messages == []
+
+
+def test_poll_workers_can_run_the_parent_on_notification() -> None:
+    with tempfile.TemporaryDirectory() as tmp:
+        root = make_tree(Path(tmp))
+        parent = "aa11bb22cc33dd44"
+        client = FakeAgentServer(goal_status={"status": "complete"}, final="x")
+        watcher = _spawn_one_worker(root, parent, client, notify_run=True)
+        watcher.poll_workers()
+        assert client.messages[0][2] is True
+
+
+class _FakeResponse:
+    def __init__(self, payload: object):
+        self._payload = payload
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *args):
+        return False
+
+    def read(self) -> bytes:
+        return json.dumps(self._payload).encode()
+
+
+def _client_returning(payload: object, seen: dict) -> spawner.AgentServerClient:
+    def opener(request, timeout):
+        seen["url"] = request.full_url
+        return _FakeResponse(payload)
+
+    return spawner.AgentServerClient("http://x", "k", opener=opener)
+
+
+def test_latest_goal_status_parses_the_event_stream() -> None:
+    # The client filters to ConversationStateUpdateEvent, newest first, and picks
+    # the newest value whose key is "goal".
+    seen: dict = {}
+    client = _client_returning(
+        {
+            "items": [
+                {"kind": "MessageEvent", "key": "x"},
+                {"kind": "ConversationStateUpdateEvent", "key": "other"},
+                {
+                    "kind": "ConversationStateUpdateEvent",
+                    "key": "goal",
+                    "value": {"status": "complete", "active": False},
+                },
+            ]
+        },
+        seen,
+    )
+    assert client.latest_goal_status("c") == {"status": "complete", "active": False}
+    assert "kind=ConversationStateUpdateEvent" in seen["url"]
+    assert "sort_order=TIMESTAMP_DESC" in seen["url"]
+    # No goal event at all -> None, so the caller falls back to the run status.
+    assert _client_returning({"items": []}, {}).latest_goal_status("c") is None
+
+
+def test_agent_server_client_sends_a_goal_and_a_message() -> None:
+    calls: list[tuple[str, str, dict | None]] = []
+
+    def opener(request, timeout):
+        payload = json.loads(request.data) if request.data else None
+        calls.append((request.method, request.full_url, payload))
+        return _FakeResponse({})
+
+    client = spawner.AgentServerClient("http://x", "k", opener=opener)
+    client.start_goal("cid", "obj", 7)
+    client.send_message("cid", "hello", run=True)
+    assert calls[0] == (
+        "POST",
+        "http://x/api/conversations/cid/goal",
+        {"objective": "obj", "max_iterations": 7},
+    )
+    assert calls[1] == (
+        "POST",
+        "http://x/api/conversations/cid/events",
+        {"role": "user", "content": [{"type": "text", "text": "hello"}], "run": True},
+    )
+
+
+def test_dashed_normalizes_a_runtime_hex() -> None:
+    hex_id = "11111111222233334444555555555555"
+    assert spawner.dashed(hex_id) == "11111111-2222-3333-4444-555555555555"
+    # Already dashed, or too short to be a runtime hex: returned unchanged.
+    assert spawner.dashed("aa11bb22cc33dd44") == "aa11bb22cc33dd44"
 
 
 def test_state_reports_spawn_status_per_conversation() -> None:

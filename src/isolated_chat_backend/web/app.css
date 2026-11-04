@@ -37,3 +37,4 @@ pre { margin: 0; padding: 12px; border: 1px solid var(--line); border-radius: 8p
 .chips { display: flex; flex-wrap: wrap; gap: 6px; margin-top: 6px; }
 .chip { padding: 1px 8px; border: 1px solid var(--line); border-radius: 999px; font-size: 11px; color: var(--muted); }
 .chip.warn { border-color: #d08a2c; color: #a5650a; background: #fdf3e3; }
+.chip.ok { border-color: #3f9142; color: #2f6b32; background: #edf7ee; }

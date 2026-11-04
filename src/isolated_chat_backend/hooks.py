@@ -25,6 +25,9 @@ The plugin is the app's standing policy for every conversation it starts:
   conversation: write ``.openhands/spawn/request-<id>.json``. The host-side
   watcher (``spawner.py``) fulfils it, because a container cannot reach the
   Agent Server. Both skills are content only; the mechanics are host-side.
+* ``skills/done/SKILL.md`` -- tells a spawned *worker* how to leave its own
+  completion summary (``.openhands/spawn/done.json``), which the watcher folds
+  into the message it posts back to the parent.
 * ``bin/hook.sh`` -- the cheap, deterministic first stage of detection. It runs
   on every ``Stop`` (and on ``UserPromptSubmit`` to catch a trigger word), keeps
   a run counter and a marker in the workspace, and writes a *request* only when
@@ -52,19 +55,23 @@ SKILL_NAME = "handover"
 # this, like the handover skill, is content -- it writes a request file into the
 # workspace the host shares.
 SPAWN_SKILL_NAME = "spawn"
+# A third skill: a spawned *worker* can leave its own completion summary, which
+# the host watcher folds into the message it posts back into the parent.
+DONE_SKILL_NAME = "done"
 
 # Where the hook script lives inside the plugin. The command refers to it through
 # ``$HOME`` because the plugin directory is mounted at ``$HOME/plugins/<name>``.
 BIN_REL = Path("bin") / "hook.sh"
 SKILL_REL = Path("skills") / SKILL_NAME / "SKILL.md"
 SPAWN_SKILL_REL = Path("skills") / SPAWN_SKILL_NAME / "SKILL.md"
+DONE_SKILL_REL = Path("skills") / DONE_SKILL_NAME / "SKILL.md"
 
 MANIFEST = {
     "name": SEED_PLUGIN_NAME,
-    "version": "0.2.0",
+    "version": "0.3.0",
     "description": (
         "Seeded by oh-isolated-chat: the conversation's standing hook policy and "
-        "the handover skill."
+        "the handover, spawn, and done skills."
     ),
 }
 
@@ -195,18 +202,63 @@ mv .openhands/spawn/request-$$.json.tmp .openhands/spawn/request-$$.json
 Fields:
 
 - **task** (required) -- the full, self-contained brief. The new conversation
-  starts with exactly this as its first message and nothing else.
+  runs this as its **goal objective**: it keeps working and a judge decides when
+  the objective is met.
 - **title** (optional) -- a short label for the new conversation.
 - **profile** (optional) -- an agent profile id to launch it on. Omit to inherit
   this conversation's profile.
 - **llm** (optional) -- an LLM profile to run it on. Omit to inherit.
+- **goal** (optional, default true) -- run the task as an OpenHands goal. Set
+  `false` to send it as a single opening message instead.
+- **max_iterations** (optional, default 10) -- how many audit rounds the goal
+  loop may take before it gives up.
 
 The host picks the file up within a few seconds, moves it aside, and records the
-new conversation's id in `.openhands/spawn/spawn.json`. If a request is
-malformed, the host records the error there instead and retries, then sets the
-file aside after a few attempts.
+new conversation's id in `.openhands/spawn/spawn.json`. When the worker finishes,
+the host posts a message with its result back into **this** conversation. If a
+request is malformed, the host records the error there instead and retries, then
+sets the file aside after a few attempts.
 
 Do **not** wait for the spawn: tell the user it was requested and continue.
+"""
+
+# The done skill. A spawned worker can leave a summary of its own result. It is
+# optional: the host detects completion from the Agent Server regardless, but a
+# summary gives the parent something an event stream would not.
+_DONE_SKILL = """\
+---
+name: done
+description: Report the result of a spawned worker task by writing a completion summary. Use at the end of a delegated task so the conversation that spawned this one learns the outcome.
+---
+
+# Report the result
+
+You were started as a **worker**: another conversation spawned you to do one
+task. When you have finished (or are blocked), write a short completion summary
+so the host can post it back to the conversation that spawned you.
+
+## What to do
+
+Write `.openhands/spawn/done.json` in your workspace, atomically:
+
+```sh
+mkdir -p .openhands/spawn
+cat > .openhands/spawn/done.json.tmp <<'JSON'
+{"status": "done", "summary": "<what you did and the result>"}
+JSON
+mv .openhands/spawn/done.json.tmp .openhands/spawn/done.json
+```
+
+Fields:
+
+- **status** -- `done`, `blocked`, or `failed`.
+- **summary** -- a concise account of what you did and the outcome. This is what
+  the parent conversation reads; keep it decision-dense, not a transcript.
+- **verdict** (optional) -- structured detail, if useful.
+- **final** (optional) -- your final answer, if it differs from the summary.
+
+This is optional -- the host also detects completion from the agent run -- but it
+is the only way to state the result in your own words, so do it.
 """
 
 
@@ -252,7 +304,11 @@ def seed(root: Path, hex_id: str) -> Path:
     script.parent.mkdir(parents=True, exist_ok=True)
     script.write_text(_HOOK_SCRIPT)
     script.chmod(script.stat().st_mode | 0o111)
-    for rel, text in ((SKILL_REL, _SKILL), (SPAWN_SKILL_REL, _SPAWN_SKILL)):
+    for rel, text in (
+        (SKILL_REL, _SKILL),
+        (SPAWN_SKILL_REL, _SPAWN_SKILL),
+        (DONE_SKILL_REL, _DONE_SKILL),
+    ):
         skill = plugin / rel
         skill.parent.mkdir(parents=True, exist_ok=True)
         skill.write_text(text)

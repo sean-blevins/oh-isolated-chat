@@ -39,7 +39,10 @@
   already has it. The plugin carries a <code>handover</code> skill and a hook that logs to
   <code>.openhands/handover/hook.log</code>, counts runs, and detects a handover request, plus a
   <code>spawn</code> skill: the agent writes a request to <code>.openhands/spawn/</code> and the
-  backend's watcher starts a new top-level conversation for it, with no page open.
+  backend's watcher starts a new top-level conversation for it, running the task as an
+  OpenHands <em>goal</em>; when the worker finishes, the host posts its result back into the
+  spawning conversation. No page needs to be open. A <code>done</code> skill lets a worker
+  leave its own completion summary.
   The conversation launches on the chosen agent profile, with the chosen LLM profile
   overriding the profile's own — the same path Canvas's own launcher uses, so the
   credentials are resolved by the Agent Server and never handled here.</span>
