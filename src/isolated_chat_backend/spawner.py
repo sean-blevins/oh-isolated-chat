@@ -55,6 +55,7 @@ import urllib.request
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Callable
+from urllib.parse import quote
 from uuid import uuid4
 
 from . import hooks, memory
@@ -404,6 +405,10 @@ class AgentServerClient:
     def list_agent_profiles(self) -> dict:
         return self.request("GET", "/api/agent-profiles")
 
+    def list_secrets(self) -> dict:
+        """The Agent Server's saved secrets: names and descriptions, no values."""
+        return self.request("GET", "/api/settings/secrets")
+
     def create_conversation(self, payload: dict) -> dict:
         return self.request("POST", "/api/conversations", payload)
 
@@ -660,6 +665,40 @@ def build_worker_payload(
     return payload
 
 
+def build_secret_refs(client) -> dict[str, dict]:
+    """``LookupSecret`` references for every secret the Agent Server holds.
+
+    A create carries *references*, never values: each is a relative URL the Agent
+    Server resolves against its own settings route on the host. The Agent Server
+    then scopes the set by the launched profile's ``secret_refs``, so a worker
+    receives exactly the secrets its profile allows -- mirroring what Canvas's own
+    launcher sends, so an extension-spawned worker matches a page-started
+    conversation. A listing failure yields no refs rather than failing the spawn.
+    """
+    try:
+        listing = client.list_secrets()
+    except (urllib.error.URLError, OSError, ValueError):
+        return {}
+    secrets = listing.get("secrets") if isinstance(listing, dict) else None
+    if not isinstance(secrets, list):
+        return {}
+    refs: dict[str, dict] = {}
+    for secret in secrets:
+        if not isinstance(secret, dict):
+            continue
+        name = secret.get("name")
+        if not isinstance(name, str) or not name:
+            continue
+        ref: dict = {
+            "kind": "LookupSecret",
+            "url": f"/api/settings/secrets/{quote(name, safe='')}",
+        }
+        if secret.get("description"):
+            ref["description"] = secret["description"]
+        refs[name] = ref
+    return refs
+
+
 def resolve_agent_profile(
     client, root: Path, parent_hex: str, request: SpawnRequest, config: SpawnerConfig
 ) -> str:
@@ -711,6 +750,10 @@ def spawn_worker(
 
     If the goal cannot be started (an Agent Server without ``/goal``), the task
     falls back to a normal ``run`` message, so a spawn still does work.
+
+    The create carries a ``LookupSecret`` reference for every secret the Agent
+    Server holds (see :func:`build_secret_refs`), exactly as the app's own page
+    start does, so a worker inherits the same credentials its profile allows.
     """
     conversation_id = reserve()
     conversation_hex = conversation_id.replace("-", "").lower()
@@ -725,6 +768,9 @@ def spawn_worker(
     payload = build_worker_payload(
         conversation_id, parent_hex, request, agent_profile_id, llm_profile_ref, goal
     )
+    secrets = build_secret_refs(client)
+    if secrets:
+        payload["secrets"] = secrets
     created = client.create_conversation(payload)
     worker_id = (
         str(created.get("id") or conversation_id)

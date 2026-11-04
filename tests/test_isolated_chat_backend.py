@@ -897,6 +897,7 @@ class FakeAgentServer:
         final: str = "",
         goal_error: Exception | None = None,
         message_error: Exception | None = None,
+        secrets: dict | None = None,
     ):
         self.payloads: list[dict] = []
         self.goals: list[tuple[str, str, int]] = []
@@ -908,9 +909,13 @@ class FakeAgentServer:
         self._final = final
         self._goal_error = goal_error
         self._message_error = message_error
+        self._secrets = secrets or {"secrets": []}
 
     def list_agent_profiles(self) -> dict:
         return self._profiles
+
+    def list_secrets(self) -> dict:
+        return self._secrets
 
     def create_conversation(self, payload: dict) -> dict:
         if self._error is not None:
@@ -1123,6 +1128,67 @@ def test_spawn_worker_seeds_creates_and_starts_a_goal() -> None:
         ).is_dir()
         assert entry["parent"] == parent
         assert entry["goal"] is True and entry["done"] is False
+
+
+def test_spawn_worker_carries_lookup_secret_refs_for_its_profile() -> None:
+    with tempfile.TemporaryDirectory() as tmp:
+        root = make_tree(Path(tmp))
+        parent = "aa11bb22cc33dd44"
+        write_record(root, parent, launched_agent_profile={"agent_profile_id": "p"})
+        config = spawner.SpawnerConfig(agent_server_url="http://x", session_key="k")
+        client = FakeAgentServer(
+            secrets={
+                "secrets": [
+                    {"name": "TEST_SECRET", "description": "a test secret"},
+                    {"name": "OPENHANDS_AUTOMATION_API_KEY"},
+                ]
+            }
+        )
+        spawner.spawn_worker(
+            root,
+            parent,
+            spawner.SpawnRequest(task="do it"),
+            config,
+            client,
+            reserve=lambda: "11111111-2222-3333-4444-555555555555",
+        )
+        # The create carries references, never values; the Agent Server scopes
+        # them by the worker's profile and resolves each on the host.
+        assert client.payloads[0]["secrets"] == {
+            "TEST_SECRET": {
+                "kind": "LookupSecret",
+                "url": "/api/settings/secrets/TEST_SECRET",
+                "description": "a test secret",
+            },
+            "OPENHANDS_AUTOMATION_API_KEY": {
+                "kind": "LookupSecret",
+                "url": "/api/settings/secrets/OPENHANDS_AUTOMATION_API_KEY",
+            },
+        }
+
+
+def test_spawn_worker_survives_a_secret_listing_failure() -> None:
+    class FailingSecrets(FakeAgentServer):
+        def list_secrets(self) -> dict:
+            raise OSError("agent server down")
+
+    with tempfile.TemporaryDirectory() as tmp:
+        root = make_tree(Path(tmp))
+        parent = "aa11bb22cc33dd44"
+        write_record(root, parent, launched_agent_profile={"agent_profile_id": "p"})
+        config = spawner.SpawnerConfig(agent_server_url="http://x", session_key="k")
+        client = FailingSecrets()
+        spawner.spawn_worker(
+            root,
+            parent,
+            spawner.SpawnRequest(task="do it"),
+            config,
+            client,
+            reserve=lambda: "11111111-2222-3333-4444-555555555555",
+        )
+        # A listing failure yields no refs, but the worker is still created.
+        assert "secrets" not in client.payloads[0]
+        assert client.payloads
 
 
 def test_spawn_worker_seeds_memory_from_the_resolved_profile() -> None:

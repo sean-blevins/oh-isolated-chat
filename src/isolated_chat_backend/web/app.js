@@ -594,6 +594,39 @@ async function loadAgentProfiles() {
   syncLlmSelect();
 }
 
+// The saved custom secrets live on the Agent Server. A create carries a
+// LookupSecret *reference* per secret -- names and a lookup URL, never a value --
+// which is the same wire format Canvas's own launcher sends. The Agent Server
+// resolves each value on the host and scopes the set by the launched profile's
+// `secret_refs`, so a conversation receives exactly the secrets its profile
+// allows. Without this the create carries no secrets at all and the profile's
+// refs stay unresolved in the runtime.
+let customSecrets = [];
+
+async function loadSecrets() {
+  const result = await hostRequest("GET", "/api/settings/secrets");
+  // Not fatal when unavailable: a create simply carries no secrets, as it did
+  // before. Either way, cache whatever came back.
+  const secrets = result.ok ? result.data?.secrets : null;
+  customSecrets = Array.isArray(secrets) ? secrets : [];
+}
+
+// The `secrets` map for a create request, or null when there are none. The URL
+// is relative: the Agent Server resolves it against itself (its own settings
+// route), so this page only ever forwards a reference.
+function buildSecrets() {
+  const secrets = {};
+  for (const secret of customSecrets) {
+    if (!secret || typeof secret.name !== "string" || !secret.name) continue;
+    secrets[secret.name] = {
+      kind: "LookupSecret",
+      url: `/api/settings/secrets/${encodeURIComponent(secret.name)}`,
+      ...(secret.description ? { description: secret.description } : {}),
+    };
+  }
+  return Object.keys(secrets).length ? secrets : null;
+}
+
 // The LLM dropdown lists every saved LLM profile; the chosen one overrides the
 // agent profile's own `llm_profile_ref` for that launch (the Agent Server
 // records the override without modifying the profile). It is hidden for an ACP
@@ -742,9 +775,11 @@ async function handOver(convo, { auto = false } = {}) {
   }
   const id = prepared.conversation_id;
   $("status").textContent = `starting successor ${short(id)}…`;
+  const secrets = buildSecrets();
   const result = await hostRequest("POST", "/api/conversations", {
     conversation_id: id,
     ...source,
+    ...(secrets ? { secrets } : {}),
     // No parent_conversation_id: the Docker runtime rejects a parent its new
     // container cannot see. The `handoverfrom` tag carries the chain instead.
     tags: prepared.tags,
@@ -814,10 +849,13 @@ async function startSeeded() {
   $("status").textContent = `starting ${short(id)}…`;
   // Only the host page holds Agent Server credentials, so it performs the
   // create. It gets the id we already seeded and the agent profile to launch
-  // on; the Agent Server resolves the profile's credentials.
+  // on; the Agent Server resolves the profile's credentials and materializes the
+  // secrets the profile's `secret_refs` allow.
+  const secrets = buildSecrets();
   const result = await hostRequest("POST", "/api/conversations", {
     conversation_id: id,
     ...source,
+    ...(secrets ? { secrets } : {}),
     initial_message: { role: "user", content: [{ type: "text", text: message }] },
   });
   if (!result.ok) {
@@ -862,5 +900,6 @@ $("auto-handover").addEventListener("change", refresh);
   await loadSpawner();
   await loadProfiles();
   await loadAgentProfiles();
+  await loadSecrets();
   await refresh();
 })();
