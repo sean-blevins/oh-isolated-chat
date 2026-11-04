@@ -57,7 +57,7 @@ from pathlib import Path
 from typing import Callable
 from uuid import uuid4
 
-from . import hooks
+from . import hooks, memory
 from .persistence import (
     RUNTIME_DATA_REL,
     read_conversation_record,
@@ -705,16 +705,20 @@ def spawn_worker(
     Seeding happens before the create because a non-goal request with an
     ``initial_message`` starts running inside the create call -- writing the
     plugin afterwards would miss the container's first run (the same ordering
-    the app's own seeded start uses). A goal worker is created idle and given
-    its goal in a second call.
+    the app's own seeded start uses). The launch profile is resolved *before*
+    seeding so the worker's memory can be seeded from the tier that profile
+    owns. A goal worker is created idle and given its goal in a second call.
 
     If the goal cannot be started (an Agent Server without ``/goal``), the task
     falls back to a normal ``run`` message, so a spawn still does work.
     """
     conversation_id = reserve()
     conversation_hex = conversation_id.replace("-", "").lower()
-    seed(root, conversation_hex)
     agent_profile_id = resolve_agent_profile(client, root, parent_hex, request, config)
+    seed(root, conversation_hex)
+    memory.seed_conversation(
+        root, conversation_hex, memory.key_for_profile(root, agent_profile_id)
+    )
     llm_profile_ref = request.llm_profile_ref or config.llm_profile_ref
     goal = request.goal if request.goal is not None else config.goal
     max_iterations = request.max_iterations or config.max_iterations
@@ -897,12 +901,19 @@ class Watcher:
     the thread wrapper only adds timing. A request is retried on a transport
     failure and set aside after :data:`MAX_ATTEMPTS` so a permanent error cannot
     spin forever.
+
+    The same loop also **captures memory**: a conversation's ``MEMORY.md`` files
+    are host-visible through the bind mount, so it unions any that changed into
+    the durable store (see :func:`memory.capture`), with no button and no Agent
+    Server call. This half runs even when ``config`` is ``None`` -- i.e. when no
+    Agent Server credentials were discovered and spawns are off -- because
+    capture needs neither, and a page-less stack should still keep memory.
     """
 
     def __init__(
         self,
         root: Path,
-        config: SpawnerConfig,
+        config: SpawnerConfig | None = None,
         client=None,
         seed: Callable[[Path, str], Path] = hooks.seed,
         reserve: Callable[[], str] = lambda: str(uuid4()),
@@ -910,8 +921,12 @@ class Watcher:
     ) -> None:
         self.root = root
         self.config = config
-        self.client = client or AgentServerClient(
-            config.agent_server_url, config.session_key, config.request_timeout
+        self.client = client or (
+            AgentServerClient(
+                config.agent_server_url, config.session_key, config.request_timeout
+            )
+            if config is not None
+            else None
         )
         self._seed = seed
         self._reserve = reserve
@@ -920,12 +935,29 @@ class Watcher:
         self._stop = threading.Event()
         self._thread: threading.Thread | None = None
         self._last_completion = 0.0
-        self._stats = {"scans": 0, "spawned": 0, "completed": 0, "notified": 0,
-                       "errors": 0, "last_scan": None, "last_completion": None,
-                       "last_error": None}
+        # The capture loop's fingerprint cache (hex -> (mtime_ns, size) per
+        # memory file), so a steady conversation costs a couple of stat calls.
+        self._seen_memory: dict[str, object] = {}
+        self._stats = {
+            "scans": 0,
+            "spawned": 0,
+            "completed": 0,
+            "notified": 0,
+            "captured": 0,
+            "errors": 0,
+            "last_scan": None,
+            "last_completion": None,
+            "last_capture": None,
+            "last_error": None,
+        }
 
     def scan_once(self) -> list[str]:
-        """Fulfil every pending request; return the ids of the workers created."""
+        """Fulfil every pending request; return the ids of the workers created.
+
+        A capture-only watcher (no spawner config) never creates anything.
+        """
+        if self.config is None:
+            return []
         created: list[str] = []
         self._stats["scans"] += 1
         self._stats["last_scan"] = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
@@ -934,6 +966,25 @@ class Watcher:
             if worker_id:
                 created.append(worker_id)
         return created
+
+    def capture_memory(self) -> list[str]:
+        """Union changed conversation memory files into the durable store.
+
+        Returns the conversation ids that contributed a line this pass. Runs
+        without any Agent Server access, so it is the one part of the loop that
+        keeps working when spawns are disabled.
+        """
+        self._stats["last_capture"] = time.strftime(
+            "%Y-%m-%dT%H:%M:%SZ", time.gmtime()
+        )
+        captured = memory.capture(self.root, self._seen_memory)
+        if captured:
+            self._stats["captured"] += len(captured)
+            self._logger(
+                "captured memory from %s conversation(s): %s"
+                % (len(captured), ", ".join(captured))
+            )
+        return captured
 
     def poll_workers(self) -> list[str]:
         """Check every unfinished worker; notify its parent once it is done.
@@ -1053,24 +1104,38 @@ class Watcher:
         return None
 
     def run_forever(self) -> None:
+        spawns_on = self.config is not None
+        poll_interval = self.config.poll_interval if spawns_on else DEFAULT_POLL_INTERVAL
+        completion_interval = (
+            self.config.completion_interval if spawns_on else DEFAULT_COMPLETION_INTERVAL
+        )
         while not self._stop.is_set():
+            # Capture first: it needs no Agent Server, and it is the half that
+            # must keep running on a stack where spawns are disabled.
             try:
-                self.scan_once()
+                self.capture_memory()
             except Exception as exc:  # noqa: BLE001 - the watcher must outlive errors
                 self._stats["errors"] += 1
                 self._stats["last_error"] = str(exc)
-                self._logger(f"scan failed: {exc}")
-            # Completion polling is less frequent than request polling: each pass
-            # costs one or more Agent Server calls per unfinished worker.
-            if time.monotonic() - self._last_completion >= self.config.completion_interval:
-                self._last_completion = time.monotonic()
+                self._logger(f"memory capture failed: {exc}")
+            if spawns_on:
                 try:
-                    self.poll_workers()
+                    self.scan_once()
                 except Exception as exc:  # noqa: BLE001
                     self._stats["errors"] += 1
                     self._stats["last_error"] = str(exc)
-                    self._logger(f"completion poll failed: {exc}")
-            self._stop.wait(self.config.poll_interval)
+                    self._logger(f"scan failed: {exc}")
+                # Completion polling is less frequent than request polling: each
+                # pass costs one or more Agent Server calls per unfinished worker.
+                if time.monotonic() - self._last_completion >= completion_interval:
+                    self._last_completion = time.monotonic()
+                    try:
+                        self.poll_workers()
+                    except Exception as exc:  # noqa: BLE001
+                        self._stats["errors"] += 1
+                        self._stats["last_error"] = str(exc)
+                        self._logger(f"completion poll failed: {exc}")
+            self._stop.wait(poll_interval)
 
     def start(self) -> threading.Thread:
         self._thread = threading.Thread(
@@ -1083,6 +1148,13 @@ class Watcher:
         self._stop.set()
 
     def status(self) -> dict:
+        if self.config is None:
+            return {
+                "enabled": False,
+                "reason": "no Agent Server credentials discovered",
+                "poll_interval": DEFAULT_POLL_INTERVAL,
+                **self._stats,
+            }
         return {
             "enabled": True,
             "agent_server_url": self.config.agent_server_url,
@@ -1100,5 +1172,9 @@ class Watcher:
 
 
 def disabled_status() -> dict:
-    """The status when no Agent Server credentials could be discovered."""
-    return {"enabled": False, "reason": "no Agent Server credentials discovered"}
+    """The status when no watcher has been started at all (spawns and capture off)."""
+    return {
+        "enabled": False,
+        "reason": "no Agent Server credentials discovered",
+        "captured": 0,
+    }

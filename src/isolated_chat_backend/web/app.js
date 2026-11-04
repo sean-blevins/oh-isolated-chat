@@ -17,7 +17,13 @@ const escapeHtml = (value) =>
 const tierCell = (tier) => {
   if (!tier.exists) return '<span class="empty">none yet</span>';
   const pending = tier.pending;
-  return `${tier.lines} lines &middot; <span class="pending${pending ? "" : " zero"}">${pending} to promote</span>`
+  // Capture is automatic (the watcher polls), so a nonzero count is transient:
+  // "pending" means "written since the last capture pass", not "needs a click".
+  const pendingNote =
+    pending > 0
+      ? `<span class="pending">${pending} pending capture</span>`
+      : '<span class="pending zero">captured</span>';
+  return `${tier.lines} lines &middot; ${pendingNote}`
     + `<div class="tier">${tier.modified ?? ""}</div>`;
 };
 // Canvas records the profile a conversation was launched with, except for a
@@ -202,7 +208,7 @@ function subtreeStats(children, id) {
   return { total, running, failed };
 }
 
-// The Open / Promote / Hand over / Fork / profile / Delete controls for a row.
+// The Open / Hand over / Fork / profile / Delete controls for a row.
 function conversationActions(convo) {
   const actions = document.createElement("div");
   actions.className = "actions";
@@ -213,10 +219,6 @@ function conversationActions(convo) {
     : "Canvas has no record for this conversation, so it cannot be opened";
   openButton.disabled = !convo.has_record;
   openButton.addEventListener("click", () => openConversation(convo));
-  const button = document.createElement("button");
-  button.textContent = "Promote";
-  button.disabled = !(convo.tiers.global.pending + convo.tiers.profile.pending);
-  button.addEventListener("click", () => promote(convo.id));
   const handoverButton = document.createElement("button");
   handoverButton.textContent = "Hand over";
   handoverButton.title =
@@ -236,7 +238,6 @@ function conversationActions(convo) {
   deleteButton.addEventListener("click", () => deleteConversation(convo));
   actions.append(
     openButton,
-    button,
     handoverButton,
     forkButton,
     profilePicker(convo),
@@ -313,8 +314,30 @@ function appendTree(rows, convo, children, depth) {
 const expanded = new Set();
 let lastState = null;
 
+// The host-wide Canvas setting that decides whether a conversation's MEMORY.md is
+// ever read. It is not the app's to change, so when it is off the page says so:
+// seeding and capture still happen, but they are inert until Canvas loads memory.
+function renderMemoryNotice(loadMemory) {
+  const notice = $("memory-notice");
+  if (loadMemory === true) {
+    notice.className = "note";
+    notice.textContent = "";
+  } else if (loadMemory === false) {
+    notice.className = "note warn";
+    notice.textContent =
+      "Memory is inert: Canvas's host-wide “load persistent memory” setting is off, so "
+      + "conversations never read the MEMORY.md this page seeds and captures. Turn it on "
+      + "in Canvas's agent settings to use memory.";
+  } else {
+    notice.className = "note";
+    notice.textContent =
+      "Could not read Canvas's “load persistent memory” setting; memory may be inert.";
+  }
+}
+
 function render(state) {
   lastState = state;
+  renderMemoryNotice(state.load_memory);
   const rows = $("rows");
   rows.replaceChildren();
   if (!state.conversations.length) {
@@ -335,17 +358,118 @@ function render(state) {
   if (!state.durable.length) {
     const p = document.createElement("p");
     p.className = "empty";
-    p.textContent = "The durable store is empty. Promote a conversation to create it.";
+    p.textContent =
+      "The durable store is empty. It fills automatically as conversations write memory.";
     durable.append(p);
     return;
   }
+  const budget = state.memory_char_budget ?? 6000;
+  let chars = 0;
   for (const file of state.durable) {
-    const h = document.createElement("h3");
-    h.innerHTML = `${escapeHtml(file.name)} &middot; <code>${escapeHtml(file.path)}</code>`;
-    const pre = document.createElement("pre");
-    pre.textContent = file.text;
-    durable.append(h, pre);
+    chars += file.chars ?? 0;
+    durable.append(durableFile(file));
   }
+  const note = document.createElement("p");
+  note.className = chars > budget ? "note warn" : "note";
+  note.textContent =
+    `${chars} characters stored. A conversation loads the global tier plus one `
+    + `profile tier, which the SDK caps at ${budget} characters; over budget it `
+    + `drops the oldest lines first, so keep this a small reference card. `
+    + `Edit or delete a line here — the change also applies to the conversation `
+    + `copies that carry it, so the next capture does not put it back.`;
+  durable.append(note);
+}
+
+// One durable file: a heading with its size, then each line with edit/delete
+// controls. Curation is human-gated because capture is append-only — without
+// it, a removed line would be re-added by any conversation still holding it.
+function durableFile(file) {
+  const wrap = document.createElement("div");
+  const h = document.createElement("h3");
+  h.innerHTML =
+    `${escapeHtml(file.name)} &middot; <code>${escapeHtml(file.path)}</code>`
+    + ` <span class="note">${file.lines ?? 0} lines &middot; ${file.chars ?? 0} chars</span>`;
+  const box = document.createElement("div");
+  box.className = "memfile";
+  const body = (file.text ?? "").replace(/\n$/, "");
+  body.split("\n").forEach((line) => box.append(durableLine(file, line)));
+  wrap.append(h, box);
+  return wrap;
+}
+
+function durableLine(file, line) {
+  const row = document.createElement("div");
+  row.className = "memline";
+  if (!line.trim()) {
+    row.classList.add("blank");
+    return row;
+  }
+  const text = document.createElement("span");
+  text.className = line.startsWith("#") ? "memtext heading" : "memtext";
+  text.textContent = line;
+  const actions = document.createElement("span");
+  actions.className = "memactions";
+  const edit = document.createElement("button");
+  edit.textContent = "Edit";
+  edit.title = "Edit this durable line";
+  edit.addEventListener("click", () => editDurableLine(row, file, line));
+  const del = document.createElement("button");
+  del.textContent = "Delete";
+  del.title = "Delete this durable line, and the copies that carry it";
+  del.addEventListener("click", () => deleteDurableLine(file, line));
+  actions.append(edit, del);
+  row.append(text, actions);
+  return row;
+}
+
+function editDurableLine(row, file, line) {
+  row.replaceChildren();
+  row.classList.add("editing");
+  const input = document.createElement("input");
+  input.type = "text";
+  input.value = line;
+  input.size = Math.max(40, line.length);
+  const save = document.createElement("button");
+  save.className = "primary";
+  save.textContent = "Save";
+  save.addEventListener("click", () => sendMemoryEdit(file.path, line, input.value));
+  const cancel = document.createElement("button");
+  cancel.textContent = "Cancel";
+  cancel.addEventListener("click", () => refresh());
+  input.addEventListener("keydown", (event) => {
+    if (event.key === "Enter") sendMemoryEdit(file.path, line, input.value);
+    if (event.key === "Escape") refresh();
+  });
+  row.append(input, save, cancel);
+  input.focus();
+}
+
+async function deleteDurableLine(file, line) {
+  const ok = confirm(
+    `Delete this durable line?\n\n${line}\n\nIt is removed from ${file.name} and `
+    + `from the conversations that carry it.`,
+  );
+  if (ok) await sendMemoryEdit(file.path, line, null);
+}
+
+async function sendMemoryEdit(path, line, text) {
+  $("status").textContent = text === null ? "deleting memory line…" : "saving memory line…";
+  const response = await fetch("api/memory", {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify(
+      text === null ? { path, line, delete: true } : { path, line, text },
+    ),
+  });
+  const body = await response.json();
+  if (!response.ok) {
+    $("status").textContent = body.error ?? "memory edit failed";
+    return;
+  }
+  $("status").textContent = body.changed
+    ? (text === null ? "memory line deleted" : "memory line saved")
+    : "no matching durable line";
+  render(body.state);
 }
 
 async function refresh() {
@@ -357,9 +481,10 @@ async function refresh() {
   await maybeAutoHandover(state);
 }
 
-// The background spawner's own status: whether it found Agent Server access, and
-// how many worker conversations it has created. A spawn needs no page open, so
-// this is the only place a stall (no credentials discovered) becomes visible.
+// The background watcher's own status. It has two halves and they report
+// separately: memory capture always runs (it needs only the host filesystem),
+// while spawns need Agent Server credentials and may be off. A spawn needs no
+// page open, so this is the only place a stall becomes visible.
 async function loadSpawner() {
   try {
     const response = await fetch("api/spawner");
@@ -372,44 +497,16 @@ async function loadSpawner() {
         + `${status.notify_parent ? "parent notified on done" : "parent not notified"})`
       : "Background spawns: off — no Agent Server credentials were discovered "
         + "(set spawner.json in the backend data dir to enable)";
+    const captured = status.captured ?? 0;
+    const when = status.last_capture ? `, last pass ${status.last_capture}` : "";
+    const note =
+      `Memory capture: on — ${captured} conversation memory file(s) merged into the `
+      + `durable store${when}` + (status.last_error ? ` (last error: ${status.last_error})` : "");
+    $("capture").textContent = note;
   } catch {
     $("spawner").textContent = "";
+    $("capture").textContent = "";
   }
-}
-
-async function promote(conversation) {
-  $("status").textContent = "promoting…";
-  const response = await fetch("api/promote", {
-    method: "POST",
-    headers: { "Content-Type": "application/json" },
-    body: JSON.stringify({ conversation }),
-  });
-  const body = await response.json();
-  if (!response.ok) {
-    $("status").textContent = body.error ?? "promote failed";
-    return;
-  }
-  const added = body.promoted.reduce(
-    (total, item) =>
-      total + Object.values(item.tiers).reduce((sum, tier) => sum + tier.added.length, 0),
-    0,
-  );
-  const into = new Set();
-  for (const item of body.promoted) {
-    for (const tier of Object.values(item.tiers)) {
-      if (tier.added.length) {
-        into.add(
-          tier.tier === "global"
-            ? "global"
-            : item.profile_name || item.profile_key,
-        );
-      }
-    }
-  }
-  $("status").textContent = added
-    ? `promoted ${added} line(s) into ${[...into].join(", ")}`
-    : "nothing new to promote";
-  render(body.state);
 }
 
 // Anything the Agent Server must do on a conversation's behalf is host-side
@@ -577,17 +674,17 @@ function openConversation(convo) {
 // Docker runtime directory it manages, so ask the host page to delete it there
 // first; then drop any runtime directory the server left behind -- a directory
 // with no Canvas record at all, or a delete that stopped partway. The durable
-// store is untouched, so promoted lines outlive the conversation.
+// store is untouched, so captured lines outlive the conversation.
 async function deleteConversation(convo) {
   const label = convo.title || short(convo.id);
   const warning = convo.has_record
     ? `Permanently delete “${label}”?\n\nCanvas loses the conversation and its `
       + "history, and its local runtime directory (sandbox home, workspace, and "
-      + "the memory it still carries) is removed. Promoted memory in the durable "
-      + "store is kept."
+      + "the memory it still carries) is removed. Durable memory in the store "
+      + "is kept."
     : `Remove the leftover runtime directory for “${label}”?\n\nCanvas has no `
-      + "record for it, so this only deletes the local directory. Promoted memory "
-      + "in the durable store is kept.";
+      + "record for it, so this only deletes the local directory. Durable memory "
+      + "in the store is kept.";
   if (!window.confirm(warning)) return;
   $("status").textContent = `deleting ${short(convo.id)}…`;
   const result = await hostRequest(
@@ -614,11 +711,23 @@ async function deleteConversation(convo) {
 // runs the model judgement; ``auto`` respects a "hold" verdict, a manual click
 // is the user overruling it.
 async function handOver(convo, { auto = false } = {}) {
+  // Resolve the launch profile before any side effect: the backend seeds the
+  // successor's memory from it, so it must be known up front, and a missing
+  // profile should fail without half-preparing a successor.
+  const source = launchSource();
+  if (!source) {
+    $("status").textContent = "No agent profile is available to launch on.";
+    return false;
+  }
   $("status").textContent = `preparing handover of ${short(convo.id)}…`;
   const response = await fetch("api/handover", {
     method: "POST",
     headers: { "Content-Type": "application/json" },
-    body: JSON.stringify({ conversation: convo.id, judge: true }),
+    body: JSON.stringify({
+      conversation: convo.id,
+      judge: true,
+      agent_profile_id: source.agent_profile_id,
+    }),
   });
   const prepared = await response.json();
   if (!response.ok) {
@@ -632,11 +741,6 @@ async function handOver(convo, { auto = false } = {}) {
     return false;
   }
   const id = prepared.conversation_id;
-  const source = launchSource();
-  if (!source) {
-    $("status").textContent = "No agent profile is available to launch on.";
-    return false;
-  }
   $("status").textContent = `starting successor ${short(id)}…`;
   const result = await hostRequest("POST", "/api/conversations", {
     conversation_id: id,
@@ -697,7 +801,9 @@ async function startSeeded() {
   const response = await fetch("api/seed", {
     method: "POST",
     headers: { "Content-Type": "application/json" },
-    body: "{}",
+    // The profile the conversation will launch on: the backend seeds that
+    // profile's durable memory tier into the conversation before it starts.
+    body: JSON.stringify({ agent_profile_id: source.agent_profile_id }),
   });
   const seeded = await response.json();
   if (!response.ok) {
@@ -729,8 +835,8 @@ async function startSeeded() {
 async function clearDurable() {
   if (
     !window.confirm(
-      "Delete every promoted memory line from the durable store? Conversations keep their own " +
-        "copies, so promoting again restores what they still carry.",
+      "Delete every durable memory line? Conversations keep their own copies, so the next " +
+        "capture pass restores what they still carry.",
     )
   ) {
     return;
@@ -748,7 +854,6 @@ async function clearDurable() {
   render(body.state);
 }
 
-$("promote-all").addEventListener("click", () => promote("all"));
 $("clear-durable").addEventListener("click", () => clearDurable());
 $("new-seeded").addEventListener("click", startSeeded);
 $("new-agent-profile").addEventListener("change", syncLlmSelect);

@@ -148,7 +148,7 @@ def remove_runtime_dir(root: Path, hex_id: str) -> bool:
     The runtime directory is the sandbox home and, usually, its workspace. The
     Canvas record (``agent-canvas/dev_conversations/<hex>``) and the durable store
     live elsewhere and are left alone: Canvas owns its record, and the durable
-    store is the whole point of promotion.
+    store is the whole point of capture.
     """
     directory = runtime_dir(root, hex_id)
     if not directory.is_dir():
@@ -171,6 +171,25 @@ def read_agent_settings(root: Path) -> dict | None:
         return None
     settings = data.get("agent_settings")
     return settings if isinstance(settings, dict) else None
+
+
+def read_load_memory(root: Path) -> bool | None:
+    """Whether Canvas's agent context loads persistent memory, or None if unknown.
+
+    ``load_memory`` is a host-wide setting, not per conversation: both the local
+    and Docker launch paths read it from ``settings.json``. When it is off, the
+    SDK never reads a conversation's ``MEMORY.md``, so seeded or captured memory
+    is inert -- surfaced here so the page can say so instead of silently doing
+    nothing. None means the file or field could not be read.
+    """
+    try:
+        data = json.loads((root / SETTINGS_REL).read_text())
+    except (OSError, ValueError):
+        return None
+    settings = data.get("agent_settings")
+    context = settings.get("agent_context") if isinstance(settings, dict) else None
+    value = context.get("load_memory") if isinstance(context, dict) else None
+    return value if isinstance(value, bool) else None
 
 
 def conversation_title(record: dict) -> str:

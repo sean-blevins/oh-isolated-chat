@@ -7,7 +7,12 @@ from datetime import datetime
 from pathlib import Path
 
 from . import handover, spawner
-from .memory import memory_paths, pending_lines, read_text
+from .memory import (
+    MEMORY_CHAR_BUDGET,
+    memory_paths,
+    pending_lines,
+    read_text,
+)
 from .persistence import (
     DURABLE_GLOBAL_REL,
     DURABLE_PROFILE_DIR,
@@ -17,6 +22,7 @@ from .persistence import (
     conversation_title,
     display_tags,
     read_conversation_record,
+    read_load_memory,
     runtime_dir,
 )
 from .profiles import profile_key, profile_names
@@ -175,8 +181,8 @@ def clear_durable(root: Path) -> list[str]:
 
     Debug-only: the durable store is what new conversations are seeded from, so
     clearing it is how you get back to a conversation that starts with no memory.
-    A conversation keeps its own copy of what it promoted, so promoting again
-    restores the lines it still carries.
+    A conversation keeps its own copy of what it captured, so the next capture
+    pass restores the lines it still carries.
     """
     removed = []
     for path in durable_files(root):
@@ -197,6 +203,7 @@ def durable_state(root: Path) -> list[dict[str, object]]:
     files = []
     for path in durable_files(root):
         key = "global" if path == root / DURABLE_GLOBAL_REL else path.parent.name
+        text = path.read_text()
         files.append(
             {
                 "path": str(path),
@@ -206,7 +213,11 @@ def durable_state(root: Path) -> list[dict[str, object]]:
                     if key == "global"
                     else names.get(key, "unknown profile")
                 ),
-                "text": path.read_text(),
+                "text": text,
+                # Surfaced so the page can show how close the store is to the
+                # SDK's prompt budget and let a human trim it line by line.
+                "lines": len(text.splitlines()),
+                "chars": len(text),
             }
         )
     return files
@@ -215,6 +226,13 @@ def durable_state(root: Path) -> list[dict[str, object]]:
 def state(root: Path) -> dict[str, object]:
     return {
         "persistence_root": str(root),
+        # Host-wide Canvas setting: when off, the SDK never reads a
+        # conversation's MEMORY.md, so seeding and capture are inert. Surfaced
+        # so the page can say so rather than silently doing nothing; the app
+        # never writes it.
+        "load_memory": read_load_memory(root),
+        # The SDK's combined prompt budget, so the page can warn near it.
+        "memory_char_budget": MEMORY_CHAR_BUDGET,
         "conversations": conversation_state(root),
         "durable": durable_state(root),
     }

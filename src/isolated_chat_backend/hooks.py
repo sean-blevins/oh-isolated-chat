@@ -28,6 +28,10 @@ The plugin is the app's standing policy for every conversation it starts:
 * ``skills/done/SKILL.md`` -- tells a spawned *worker* how to leave its own
   completion summary (``.openhands/spawn/done.json``), which the watcher folds
   into the message it posts back to the parent.
+* ``skills/memory/SKILL.md`` -- tells the agent how and when to write durable
+  memory, and into which of the two tiers. The SDK already injects two-tier
+  guidance when ``load_memory`` is on; this adds the app's policy, because the
+  host captures ``MEMORY.md`` automatically as an append-only line union.
 * ``bin/hook.sh`` -- the cheap, deterministic first stage of detection. It runs
   on every ``Stop`` (and on ``UserPromptSubmit`` to catch a trigger word), keeps
   a run counter and a marker in the workspace, and writes a *request* only when
@@ -58,6 +62,10 @@ SPAWN_SKILL_NAME = "spawn"
 # A third skill: a spawned *worker* can leave its own completion summary, which
 # the host watcher folds into the message it posts back into the parent.
 DONE_SKILL_NAME = "done"
+# A fourth skill: how and when to write durable memory, and into which tier. The
+# host seeds the durable store in and captures it back automatically, so the
+# skill's real content is the policy (one fact per line, which tier).
+MEMORY_SKILL_NAME = "memory"
 
 # Where the hook script lives inside the plugin. The command refers to it through
 # ``$HOME`` because the plugin directory is mounted at ``$HOME/plugins/<name>``.
@@ -65,13 +73,14 @@ BIN_REL = Path("bin") / "hook.sh"
 SKILL_REL = Path("skills") / SKILL_NAME / "SKILL.md"
 SPAWN_SKILL_REL = Path("skills") / SPAWN_SKILL_NAME / "SKILL.md"
 DONE_SKILL_REL = Path("skills") / DONE_SKILL_NAME / "SKILL.md"
+MEMORY_SKILL_REL = Path("skills") / MEMORY_SKILL_NAME / "SKILL.md"
 
 MANIFEST = {
     "name": SEED_PLUGIN_NAME,
-    "version": "0.3.0",
+    "version": "0.4.0",
     "description": (
         "Seeded by oh-isolated-chat: the conversation's standing hook policy and "
-        "the handover, spawn, and done skills."
+        "the handover, spawn, done, and memory skills."
     ),
 }
 
@@ -261,6 +270,80 @@ This is optional -- the host also detects completion from the agent run -- but i
 is the only way to state the result in your own words, so do it.
 """
 
+# The memory skill. The SDK already injects two-tier persistent-memory guidance
+# when ``load_memory`` is on; this adds the app's own policy. The app owns both
+# halves of the loop (seed in, capture back), and capture is an append-only line
+# union that a human curates, so the skill stresses *what is worth keeping* --
+# a small reference card, never a running log -- and which tier a fact belongs
+# in. Evolving state belongs in the handover artifact or the spawn brief, not
+# here.
+_MEMORY_SKILL = """\
+---
+name: memory
+description: Record durable, reusable reference that should outlive this conversation. Use sparsely -- memory is a small reference card, not a notebook. Use when you learn how this project is built, run or tested, a lasting caveat, a stable user preference, or when the user asks you to remember something.
+---
+
+# Memory
+
+Your `MEMORY.md` files are **durable beyond this chat**: the host captures their
+lines and seeds them into every conversation that launches afterwards, so a line
+you write here becomes standing knowledge. There is no button to press.
+
+Because it is inherited by every future conversation, memory is **expensive and
+deliberately small**. Treat it as the reference card a fresh teammate reads
+before touching the repo -- not as context, notes, or a transcript. Most turns
+should write nothing.
+
+## Two tiers
+
+- **User memory** -- the *User memory* directory named in your `<MEMORY>` context
+  (`$HOME/memory/MEMORY.md` in this container). About the *person*: their name
+  and role, how they like to work, standing preferences and corrections. Every
+  project on this host sees these lines.
+- **Project memory** -- `.openhands/memory/MEMORY.md` under the workspace root.
+  Durable *reference* about this codebase: how to build, run and test it, where
+  the important things live, environment caveats, tooling choices, project-wide
+  conventions. Every conversation on this agent profile sees these lines.
+
+## What belongs (write these)
+
+- How to build, run and test this project -- the exact commands, so nobody
+  rediscovers them.
+- Environment and caveats a fresh worker would otherwise learn the hard way:
+  ports, required services, platform quirks, known-flaky steps.
+- Where the important things live: entry points, config, where tests go.
+- A stable user preference, or a correction to one.
+- A convention or constraint that holds beyond the current task.
+
+Test before writing: **would a worker starting a *different* task on this repo be
+wrong or slow without this line?** If not, do not write it.
+
+## What must not go here
+
+- Task progress, plans, TODOs, "currently on step 3".
+- Decisions still in play, and the road not taken -- "we tried X, reverted, now
+  doing Y". That is evolving state: put it in `.openhands/handover/handover.md`.
+- Detail only the task at hand needs: put it in the spawn request's `task`.
+- Anything trivially re-derived by reading the code.
+- Secrets or credentials.
+- A line already present, or a near-duplicate of one.
+
+## How to write
+
+- One durable fact per line, starting with `- `. A reader may see the line
+  alone, so make it self-contained:
+  `- Tests: python3 -m pytest tests/ (stdlib only, no deps)`.
+- **Prefer editing an existing line over appending a new one.** If a fact
+  changed, replace the old line; if two lines say almost the same thing, merge
+  them. Keep the card tight.
+- Never re-wrap or reorder unrelated lines. Capture is an append-only union and a
+  human curates the durable store, so a cleanup you make here may not delete the
+  stored copy -- keep writes clean at the source instead.
+- Keep each tier small. The SDK loads only the first ~6000 characters of both
+  tiers combined, and when a file is over budget it drops the **oldest** lines
+  first -- so an oversized file loses the foundational facts you meant to keep.
+"""
+
 
 def hooks_config() -> dict:
     """The hook policy the seeded plugin contributes.
@@ -289,7 +372,8 @@ def seed(root: Path, hex_id: str) -> Path:
     """Write the seed plugin into a conversation's runtime dir (idempotent).
 
     Writes the manifest, the hooks config, the hook script (executable), and the
-    handover skill. Re-seeding overwrites in place rather than stacking up.
+    handover, spawn, done, and memory skills. Re-seeding overwrites in place
+    rather than stacking up.
     """
     plugin = plugin_dir(root, hex_id)
     (plugin / ".claude-plugin").mkdir(parents=True, exist_ok=True)
@@ -308,6 +392,7 @@ def seed(root: Path, hex_id: str) -> Path:
         (SKILL_REL, _SKILL),
         (SPAWN_SKILL_REL, _SPAWN_SKILL),
         (DONE_SKILL_REL, _DONE_SKILL),
+        (MEMORY_SKILL_REL, _MEMORY_SKILL),
     ):
         skill = plugin / rel
         skill.parent.mkdir(parents=True, exist_ok=True)

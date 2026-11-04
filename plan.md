@@ -50,8 +50,8 @@ allowlist (`LANG, LC_ALL, LC_CTYPE, PATH, TMPDIR, TZ`; `HOME` is overridden to
 | # | Feature | Verdict | Lives in | Mechanism |
 | --- | --- | --- | --- | --- |
 | 1 | Fork conversations | **Shipped** | L1 → L4 | `POST /api/conversations/{id}/fork`; server copies `docker_runtime/forking.py` |
-| 2 | Promote conversation memory | **Shipped** | L2 | Line-union into the durable store |
-| 3 | Seed new conversation memory | **Contract exists; UI missing** | L2 + L4 | `docker_runtime/memory_seed.py` seeds durable → runtime at container build; app only needs an editor |
+| 2 | Capture conversation memory | **Shipped (automatic)** | L2 | Watcher change-detects `MEMORY.md`, line-unions into the durable store; no button |
+| 3 | Seed new conversation memory | **Shipped** | L2 | App unions the durable store into the runtime `MEMORY.md` before the create; the SDK's own `load_memory` reads it |
 | 4 | Fork with a different model | **Shipped** | L1 → L4 | `ForkConversationRequest.llm_profile_ref` + L2 picker |
 | 5 | Seed instructions/hooks into all new conversations | **Feasible — hooks proven** | L2 | Memory: durable store. Hooks: host-seeded plugin picked up by the container's ambient discovery |
 | 6 | Alter the conversation UI | **Not feasible now** | L5 (upstream) | No contribution point |
@@ -67,32 +67,34 @@ Details follow.
 
 ## 3. Per-feature detail
 
-### 1–2. Fork and Promote — already shipped
+### 1–2. Fork and memory capture — already shipped
 
 No work. Fork is host-side (`docker_runtime/forking.py` copies `events/`,
 `bash_events/`, patched `base_state.json`, `meta.json` under a fresh identity);
-Promote is the L2 line union. Both already have UI on the app page.
+memory **capture** is the L2 line union, run automatically by the backend watcher
+when a conversation's `MEMORY.md` changes (`(mtime_ns, size)` fingerprint). There
+is no Promote button: capture needs no user trigger, and `/api/promote` survives
+only as a debug path. Both are surfaced on the app page.
 
-### 3. Seed new conversation memory — the contract is already there
+### 3. Seed new conversation memory — shipped, as the other half of the loop
 
-The Agent Server already seeds durable memory into every new conversation at
-container build: `docker_runtime/memory_seed.py` unions the durable host store
-into the conversation's runtime memory before `docker run`.
+The SDK exposes two runtime tiers the agent writes and reads:
 
-| Tier | Durable (host) | Runtime (container) |
+| Tier | Runtime (container) | Durable (host) |
 | --- | --- | --- |
-| global (user) | `<persistence>/memory/MEMORY.md` | `runtime-data/<hex>/persistence/memory/MEMORY.md` |
-| project / profile | `<persistence>/memory/agents/<key>/MEMORY.md` | `runtime-data/<hex>/workspace/.openhands/memory/MEMORY.md` |
+| global (user) | `runtime-data/<hex>/persistence/memory/MEMORY.md` | `<persistence>/memory/MEMORY.md` |
+| project / profile | `runtime-data/<hex>/workspace/.openhands/memory/MEMORY.md` | `<persistence>/memory/agents/<key>/MEMORY.md` |
 
-So "seed new conversation memory" is a **UI gap, not a contract gap**. What is
-missing is a way to author the durable store directly (today it is only written
-by promoting a conversation). Add a durable-store editor to L2/L3: read, edit,
-and save `<persistence>/memory/MEMORY.md` and the per-profile files. Low effort,
-extension-only.
+The app already **seeds** the durable store into a conversation's runtime files
+before its container starts, keyed by the agent profile it launches on, across
+all three creation seams (a user-started conversation, a spawned worker, a
+handover successor). Seeding runs at `POST /api/seed` and inside the watcher's
+spawn path, so it needs no UI. The durable store is written by capture (feature 2),
+so there is **no separate editor**: the loop keeps both sides in step.
 
-> Note the asymmetry the app already documents: seeding is a one-way union at
-> build; the user tier is *written inside* the container, so a writeback rule
-> (Promote) is required. Seeding does not run on eviction or delete.
+`load_memory` (host-wide, Canvas-owned) decides whether the SDK injects the file
+into the prompt; the app surfaces its value but never changes it. With it off,
+seeding is inert.
 
 ### 4. Fork with a different model — already shipped
 
@@ -107,11 +109,12 @@ memory still lands in the source profile's tier. If you want "fork onto model X
 
 Three mechanisms, with very different maturity:
 
-- **Memory instructions (do now).** Writing text into the global durable
+- **Memory instructions (done).** Writing text into the global durable
   `memory/MEMORY.md` injects it into every new conversation's prompt as the
-  `<MEMORY_CONTEXT>` block. This is the cleanest "standing instructions for every
-  new conversation" and it already works end-to-end. Deliver it as part of
-  feature 3's editor.
+  `<MEMORY_CONTEXT>` block, because the app seeds the durable store into each
+  conversation it starts and the SDK's `load_memory` reads it. That is the
+  cleanest "standing instructions for every new conversation"; the seeded plugin
+  also carries a `memory` skill telling the agent how and when to write it.
 - **Hooks (proven, extension-only).** Correcting the earlier note: hooks do
   **not** load from a bare `<persistence>/hooks.json`. `LocalConversation` loads
   hooks from exactly two sources — (1) the `hook_config` field of the start
@@ -528,6 +531,31 @@ a `▸ N workers` toggle tinted by group health; a worker with no surviving pare
 stays top-level. This is the first piece of the deferred orchestrator UI (the tree
 of isolated conversations); campaign grouping and an attention inbox build on it.
 
+**Reworked (2026-11-04) — memory becomes a button-free seed + capture loop.** The
+earlier design treated memory as two explicit user actions: **Seed** (start a
+conversation) and **Promote** (a button per row). Both are gone from the UI; the
+loop now runs on its own:
+
+- **Seed** is folded into every creation seam. `POST /api/seed` writes the plugin
+  *and* unions the durable store into the conversation's runtime `MEMORY.md`
+  files, keyed by the launch profile; the watcher's spawn path and the handover
+  successor do the same. New conversations start with the memory their profile
+  owns without anyone asking.
+- **Capture** is a change-detection pass, not a button. `Watcher.capture_memory`
+  keeps a `(mtime_ns, size)` fingerprint per `MEMORY.md` and line-unions a file the
+  moment it changes, so a line the agent writes reaches the durable store a poll
+  (2 s) later. `/api/promote` survives only as a debug path.
+- **The seeded plugin** gained a fourth skill, `memory`, telling the agent *how
+  and when* to store durable facts (which tier, small index, append not rewrite).
+- **The page** shows a `Memory capture` line beside `Background spawns` and a
+  per-row `captured`/`N pending capture` cell; `load_memory` is surfaced but never
+  changed by the app. Capture is host-file work, so it runs even when no Agent
+  Server credentials were discovered (spawns off).
+- **Verified live.** `e2e/memory.mjs` (in `../openhands-test`) drives the real
+  managed backend and a real LLM: seed both tiers → agent appends a line →
+  watcher captures it. It self-cleans (deletes the conversation, strips its
+  canary lines) unless `E2E_KEEP=1`.
+
 **Build 1 (2026-11-03; reverted 2026-11-04) — the background spawner (Option 1).**
 The "page must be open" caveat is removed by giving the backend Agent Server
 access. Configuration is **discovered by default** (no file to hand-write): the
@@ -575,9 +603,9 @@ radar:
 - **A manager conversation** whose agent has a small toolset over the child
   API: `POST /{id}/children` (spawn), `GET /api/conversations/search` (inventory),
   `GET /{id}` (metrics), `POST /{id}/fork` / `condense` / `interrupt` (act),
-  plus the app's own handover/promote endpoints.
+  plus the app's own handover/memory endpoints.
 - **L2 as the control plane**: the policy engine (when to spawn, when to hand
-  over, when to promote) and the durable-state store, because it sees all
+  over) and the durable memory store, because it sees all
   conversations and can act without a UI open.
 - **The hard parts** are not the APIs — they are policy: naming/linking the
   child tree, budgeting tokens/cost across children, deciding when a child is
@@ -590,8 +618,8 @@ radar:
 ## 4. Suggested phasing
 
 **Phase 1 — extension-only, no upstream dependency (build now).**
-- Durable-store editor (feature 3) — unblocks "seed memory / standing
-  instructions for every new conversation."
+- Memory loop (features 2–3): **done** — automatic seed + capture with no editor,
+  so standing instructions reach every new conversation.
 - Handover, manual (feature 8) — the headline feature.
 - Spawn-child action + verify the docker child path (feature 10).
 - Auto-handover **suggestions** at a threshold (feature 9, suggest-only).
@@ -617,7 +645,7 @@ radar:
   (6–7); a workspace seed step (5). (User-tier hooks loading natively is no
   longer needed — the plugin-seed seam covers it, but it would still be a nice
   convenience.)
-- **Keep internal (app-only) for now:** durable-store editing (3), handover (8),
+- **Keep internal (app-only) for now:** the memory loop (2–3), handover (8),
   auto-handover policy (9), spawn-child UI (10). These are host-side behavior
   with a user trigger — exactly what a Canvas App is for — and they do not
   require forking anything.

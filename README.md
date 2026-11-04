@@ -6,15 +6,18 @@ things a container cannot do for itself.
 Four actions today:
 
 - **Start a seeded conversation** — create a conversation the app owns and seed
-  a hook plugin into it before it starts, so the container's first run already
-  has the hook (the app-side answer to host hooks never loading, ISO-13).
-- **Promote** — merge a conversation's memory into the durable host store that
-  new conversations are seeded from (the host half of ISO-07).
+  a hook plugin **and memory** into it before it starts, so the container's first
+  run already has the hook and the memory the launch profile owns (the app-side
+  answer to host hooks never loading, ISO-13, and the host half of ISO-07).
+- **Memory** is a two-way loop with no button: the app **seeds** a conversation's
+  runtime memory from the durable host store before it starts, and a backend
+  watcher **captures** the conversation's memory back into that store as it
+  changes. See *Memory: seed and capture* below.
 - **Fork** — copy a conversation's full history and state into a new
   conversation (ISO-08), on the source's LLM profile or on another one picked
   per row.
 - **Clear the durable store** — debug only, and removed before any release: drop
-  everything promoted so far, so a new conversation starts with no memory.
+  every captured line, so a new conversation starts with no memory.
 
 A fifth runs without any page: a conversation's agent can **spawn** another
 top-level conversation by writing a request file into its workspace; a backend
@@ -37,15 +40,17 @@ isolation. A Canvas App is the supported seam for host-side behavior with a
 user-facing trigger, so that is where these actions live. The page is a control
 plane over isolated conversations, not a chat UI.
 
-There is no "pull": a conversation's memory is already host-visible, because its
-runtime directory is a bind mount. Promotion reads the conversation's
-`MEMORY.md` files straight off disk and unions them into the durable store.
+There is no "pull" for memory: a conversation's memory is already host-visible,
+because its runtime directory is a bind mount. Capture reads the conversation's
+`MEMORY.md` files straight off disk and unions them into the durable store; seed
+goes the other way, unioning the durable store into the files before the
+container starts.
 
 ## Where each gap is handled
 
 | Gap                                                   | Where it is fixed                                         | Status here                                                                       |
 | ----------------------------------------------------- | --------------------------------------------------------- | --------------------------------------------------------------------------------- |
-| ISO-07 memory: durable seed, never written back       | Agent Server seeds at container build; this app promotes  | hosted                                                                            |
+| ISO-07 memory: durable seed, never written back       | Agent Server seeds at container build; this app seeds *and* captures | hosted                                                                            |
 | ISO-08 branch/fork → 501                              | Agent Server forks the persisted conversation (host side) | hosted                                                                            |
 | ISO-09 `switch_llm` / `switch_profile` → 501          | Agent Server contract                                     | pending (a fork picks a profile; an isolated conversation cannot switch in place) |
 | ISO-10 `credential-bindings` → 501                    | Agent Server contract                                     | pending                                                                           |
@@ -53,8 +58,8 @@ runtime directory is a bind mount. Promotion reads the conversation's
 | ISO-13 host hooks never load                          | Handled here: a hook plugin seeded into a conversation this app starts | hosted (app-started conversations; see below)                                     |
 | ISO-19 `events/search` drops container-written events | Agent Server contract                                     | pending                                                                           |
 
-When an SDK gap closes, its surface belongs on this page next to Promote and
-Fork.
+When an SDK gap closes, its surface belongs on this page next to Fork and the
+memory loop.
 
 ## Memory tiers
 
@@ -76,16 +81,38 @@ and the durable store agree in human terms; an id with no profile file left
 falls back to its short id, and a root with no default profile at all falls back
 to the literal `default` key.
 
-## Promotion is a line union
+## Memory: seed and capture
 
-The durable file keeps its existing order; every incoming line it does not
-already have is appended. Comparison ignores surrounding whitespace, blank
-lines are never appended, and the conversation's own copy is never rewritten.
-Promotion is therefore idempotent: promoting twice adds nothing the second time.
+Memory moves in two directions, both as a **line union**, and neither needs a
+button.
 
-Promotion is always explicit. Idle eviction and deletion do not promote —
-those conversations still exist on disk and can be resumed, so their memory
-should not be merged until someone asks for it.
+**Seed** runs before a conversation's container starts. The app unions the
+durable store into the conversation's runtime `MEMORY.md` files — the files the
+SDK's `load_memory` reads — keyed by the agent profile the conversation launches
+on. It covers all three creation seams: a conversation you start, a spawned
+worker, and a handover successor.
+
+**Capture** runs as the conversation works. The backend's background watcher
+polls every conversation's `MEMORY.md` files and, when one changes, unions it
+into the durable store. Change detection is a `(mtime, size)` fingerprint per
+file, so a file is read only when it moved; the durable global tier is written
+by the global file's changes and each project tier by its profile's file.
+
+The union itself is the same in both directions: the destination keeps its
+existing order, every incoming line it does not already have is appended,
+comparison ignores surrounding whitespace, blank lines are never appended, and
+the source's own copy is never rewritten. It is therefore idempotent — unioning
+twice adds nothing the second time. Writes are serialized by a lock, so the
+watcher and a manual `/api/promote` (kept for debugging) cannot interleave.
+
+Only `MEMORY.md` is seeded and captured; the SDK's daily logs (`YYYY-MM-DD.md`)
+are deliberately left alone. Capture is automatic, so idle eviction and deletion
+do not trigger a special pass: a conversation's memory has already been folded
+into the store by the time it stops changing.
+
+`load_memory` is a host-wide Canvas setting the SDK reads; the app does not
+change it (seeding is inert without it) but surfaces its current value on the
+page so an empty memory block is never a mystery.
 
 ## Fork
 
@@ -127,11 +154,13 @@ container scans `<runtime>/persistence/plugins/` and
 `<runtime>/workspace/.openhands/plugins/`. Seeding a plugin into either is how a
 hook reaches a conversation — no image change and no Agent Server change.
 
-`POST /api/seed` reserves the id (the app chooses it) and writes the plugin under
-`<runtime>/persistence/plugins/handover-hook/`, returning the id. The page then
-asks the host to `POST /api/conversations` with that id and body. Owning the id is
-what makes it deterministic: a conversation created with an `initial_message`
-starts running inside that same call, so seeding after it is too late.
+`POST /api/seed` reserves the id (the app chooses it), writes the plugin under
+`<runtime>/persistence/plugins/handover-hook/`, and unions the durable memory the
+launch profile owns into the conversation's two runtime `MEMORY.md` files,
+returning the id. The page then asks the host to `POST /api/conversations` with
+that id and body. Owning the id is what makes it deterministic: a conversation
+created with an `initial_message` starts running inside that same call, so
+seeding after it is too late.
 (Canvas-started conversations pick their own id; covering those needs a
 filesystem watcher that seeds during container startup, which this app does not
 do yet.)
@@ -160,13 +189,17 @@ that one launch (the Agent Server records the override without modifying the
 stored profile). For an ACP agent profile, which names its own backend instead of
 an LLM profile, the LLM dropdown is disabled.
 
-The seeded plugin carries two things: a `handover` **skill** (AgentSkills format,
-`skills/handover/SKILL.md`) and a **hook** (`hooks/hooks.json` dispatching to
-`bin/hook.sh`). The hook runs on `session_start`, `user_prompt_submit` and
-`stop`: it appends to `.openhands/handover/hook.log`, records the conversation id
-once, and on `stop` counts runs and writes a *request* when a cheap threshold
-trips. It never calls a model — the expensive judgement is host-side. See
-**Handover** below.
+The seeded plugin carries both **content** and a **hook**: four AgentSkills
+(`skills/handover`, `skills/spawn`, `skills/done`, and `skills/memory`) and a
+hook (`hooks/hooks.json` dispatching to `bin/hook.sh`). The `memory` skill tells
+the agent *how and when* to store durable facts: what belongs in each tier
+(user-global prefs and style in `persistence/memory/MEMORY.md`; project and
+how-to-run facts in `.openhands/memory/MEMORY.md`), to keep `MEMORY.md` a small
+high-value index, and to append rather than rewrite. The hook runs on
+`session_start`, `user_prompt_submit` and `stop`: it appends to
+`.openhands/handover/hook.log`, records the conversation id once, and on `stop`
+counts runs and writes a *request* when a cheap threshold trips. It never calls
+a model — the expensive judgement is host-side. See **Handover** below.
 
 ## Handover
 
@@ -232,11 +265,13 @@ The three parts:
    atomically, and then carry on. The container cannot do more than ask; the
    skill is content, not mechanics.
 2. **The watcher.** The backend runs a background thread that polls
-   `runtime-data/*/workspace/.openhands/spawn/` every couple of seconds. When it
-   finds a request it reserves an id, **seeds the plugin into the new runtime
-   directory before the create** (so the worker's first run already has the hook
-   and all three skills), and creates a **top-level** conversation through the
-   Agent Server API, tagged `role=worker` / `spawnedby=<parent hex>`.
+   `runtime-data/*/workspace/.openhands/spawn/` every couple of seconds (and, on
+   the same loop, captures conversation memory — see *Memory: seed and capture*).
+   When it finds a request it reserves an id, **seeds the plugin and the worker
+   profile's memory into the new runtime directory before the create** (so the
+   worker's first run already has the hook and all four skills), and creates a
+   **top-level** conversation through the Agent Server API, tagged `role=worker`
+   / `spawnedby=<parent hex>`.
 3. **The create is host-side.** The backend is a child of the Agent Server
    process, so it discovers the Agent Server's listen address and session key
    from that parent (`/proc/<ppid>/environ` and its `--host`/`--port` argv), with
@@ -306,14 +341,18 @@ its workers, each indented and carrying its run status (`goal running`,
 A worker whose parent no longer exists stays at the top level. The parent row
 keeps the `spawn requested` / `spawn error` chips, and the header's **Background
 spawns** line reports whether the watcher found Agent Server access and how many
-workers it has created and completed (`GET /api/spawner`).
+workers it has created and completed (`GET /api/spawner`). A companion **Memory
+capture** line reports how many memory files the watcher has folded into the
+durable store and when it last ran; capture is independent of spawn access, so
+it stays on even when no Agent Server credentials were discovered.
 
 > **Open item.** The watcher needs the backend to actually be running (it is a
-> managed backend: Canvas starts it the first time the page is opened) and to
-> discover Agent Server access. Discovery is verified against the local dev
-> stack; on a deployment it must be checked, and `spawner.json` is the override
-> when discovery cannot find the credentials. If the header says *off*, no
-> credentials were discovered and no spawn will be fulfilled.
+> managed backend: Canvas starts it the first time the page is opened) and, for
+> spawns, to discover Agent Server access. Discovery is verified against the local
+> dev stack; on a deployment it must be checked, and `spawner.json` is the
+> override when discovery cannot find the credentials. If the header says
+> background spawns are *off*, no credentials were discovered and no spawn will be
+> fulfilled — memory capture still runs, since it needs only the host filesystem.
 
 ## Names and tags
 
@@ -339,7 +378,7 @@ disagree.
   have persisted run state (`base_state.json`) beside the record. A conversation
   that was recorded but never ran a turn has no sidebar row.
 - **This page** lists the Docker runtime directories under `runtime-data/<hex>/`,
-  because those are what it promotes from, forks, and deletes. Every such
+  because those are what it captures from, forks, and deletes. Every such
   directory gets a row whether or not Canvas still has a catalog record for it.
 
 The two drift in both directions, so each row now says which side it is on:
@@ -350,9 +389,10 @@ The two drift in both directions, so each row now says which side it is on:
 | `Untitled` + **not in Canvas · no stored record** | a runtime directory with no record (e.g. a create that failed after the directory was armed) | no |
 | a title + **not in Canvas · no saved state** | a record that never ran a turn | no |
 
-A row the sidebar omits is still promotable and deletable here. **Delete** asks
+A row the sidebar omits is still captured and deletable here. **Delete** asks
 Canvas to delete the conversation (when there is a record) and then removes the
-local runtime directory; the durable store is left alone.
+local runtime directory; the durable store is left alone, so captured lines
+outlive the conversation they came from.
 
 ## Layout
 
@@ -366,29 +406,31 @@ src/isolated_chat_backend/  the host process: stdlib-only Python package
   persistence.py         the host store layout, conversation records, and the
                          runtime-directory removal the Delete action uses
   profiles.py            agent profiles and the durable memory key they own
-  memory.py              the promotion line union
+  memory.py              the durable store and the seed/capture line union
   hooks.py               the seed plugin: manifest, hooks, the cheap gate
-                         script, and the handover + spawn + done skills, written
-                         into a new conversation's runtime dir before it starts
+                         script, and the handover + spawn + done + memory skills,
+                         written into a new conversation's runtime dir before it
+                         starts
   handover.py            host-side handover: read the cheap request, optional
                          model judgement, build the artifact, seed the successor
-  spawner.py             the background spawner: discover Agent Server access
-                         from the parent process, a file-watcher that turns a
-                         conversation's spawn request into a top-level worker
-                         running as a goal, and the completion poll that posts
-                         the worker's result back into the parent
-  state.py               the /api/state payload (handover + spawn state, and the
-                         flags that say whether Canvas lists a row) and the
-                         debug clear
+  spawner.py             the background watcher: discover Agent Server access from
+                         the parent process, turn a conversation's spawn request
+                         into a top-level worker running as a goal, post the
+                         worker's result back into the parent, and capture every
+                         conversation's memory into the durable store on the same
+                         poll
+  state.py               the /api/state payload (handover + spawn state, the
+                         load_memory setting, and the flags that say whether
+                         Canvas lists a row) and the debug clear
   server.py              HTTP routing (GET /health, /api/state, /api/spawner,
-                         /, assets; POST /api/seed, /api/handover, /api/promote,
-                         /api/delete, /api/clear)
-  __main__.py            argv parsing, store discovery, the spawner thread, serve
+                         /, assets; POST /api/seed, /api/handover, /api/promote
+                         [debug], /api/delete, /api/clear)
+  __main__.py            argv parsing, store discovery, the watcher thread, serve
   web/                   the backend view served to the iframe:
                          index.html, app.css, app.js
 backend/linux-amd64.tar.gz  built artifact (bin/ + lib/); digest pinned in the manifest
 scripts/build-backend.sh builds the artifact and rewrites the pinned digest
-tests/test_isolated_chat_backend.py  unit tests for the union, path resolution, the hook seed, handover, and the spawner (goal, completion, parent notify)
+tests/test_isolated_chat_backend.py  unit tests for the union, path resolution, the hook seed, memory seed/capture, handover, and the spawner (goal, completion, parent notify)
 docs/conversation-isolation-gaps.md  the original gap inventory (ISO-nn)
 ```
 
@@ -415,13 +457,14 @@ bridge (`canvas_app_backend_bridge_v1`, released in Agent Server 1.56.0) and
 | ------- | ---------------------------------------------------------------------------------------------------------------------------------- |
 | Start   | The Canvas App backend bridge, a Docker-runtime Agent Server, and a persisted `settings.json` with `agent_settings` to launch from. |
 | Spawn   | The managed backend running with Agent Server access (discovered from its parent process, or set in `spawner.json`). No page open at spawn time. Worker goals need `POST /{id}/goal`; without it the task falls back to a normal run. |
-| Promote | Nothing server-side to run it — it reads the conversation's files and writes the host store. Its **effect** (a new isolated conversation starting from the promoted memory) needs an Agent Server that seeds the durable store at container build. |
+| Memory  | Nothing server-side beyond the conversation files: **seed** writes them before the create and **capture** reads them off disk; both are host-file work. Seeding's **effect** — the agent actually loading the memory — needs the host-wide `load_memory` setting on. |
 | Fork    | Agent Server with the host-side Docker fork route; a stock release answers `501`.                                                   |
 
-All three are Agent Server contracts or app-host work, not image changes, so
+All of these are Agent Server contracts or app-host work, not image changes, so
 upstream releases will carry the contract half; until they do, point the Agent
-Server at a checkout that has them. Without them the page still works: Promote
-only changes the host store, and each Fork row reports the server's error.
+Server at a checkout that has them. Without them the page still works: memory
+only changes the conversation and host files, and each Fork row reports the
+server's error.
 
 ## Install
 
@@ -470,10 +513,15 @@ must accept it once. The durable fix is a certificate the browser already trusts
   exact for local OpenHands launches, where `default` is precisely the profile
   that skips the record; a launch that omitted the record for another reason
   would also be attributed to `default`.
-- The backend writes the durable store in place; it has no lock. Two
-  simultaneous promotions of the same store could interleave, which for a
-  line union costs at most a duplicated line.
-- Nothing promotes automatically on eviction or delete, by design.
+- The durable-store union is not a merge: a line an agent later **corrects** is
+  appended as a new line, and the stale line stays. Only whole lines are ever
+  added, never updated or removed, so the store is append-only by design.
+- Capture polls on the same couple-of-seconds loop as spawns, so a line written
+  by the agent reaches the store shortly after the file changes, not instantly.
+  Only `MEMORY.md` is watched; the SDK's daily logs are not captured.
+- Capture is host-file work, so it runs even when no Agent Server credentials
+  were discovered (spawns would be off); only `load_memory` being off makes the
+  seeded memory inert to the agent.
 - Fork needs an Agent Server whose host-side fork route is live; an older server
   answers 501 and the row reports the failure.
 - Clearing the durable store is debug-only and will be removed: it exists to get
@@ -515,11 +563,12 @@ must accept it once. The durable fix is a certificate the browser already trusts
 - **Archive on done is not implemented.** There is no archive HTTP endpoint; the
   closest is `DELETE /api/conversations/{id}/runtime` (stop the container, keep
   its history and workspace), deferred.
-- The spawner discovers Agent Server access from its parent process (`/proc`), so
+- The watcher discovers Agent Server access from its parent process (`/proc`), so
   it is Linux-only by default; a non-Linux host needs `spawner.json` with the
-  Agent Server URL and session key. It requires the managed backend to be running
-  (Canvas starts it the first time the page is opened); if the header says the
-  spawner is off, no credentials were discovered.
+  Agent Server URL and session key. Capture needs none of that — it is plain
+  host-file work — but spawns need the managed backend to be running (Canvas
+  starts it the first time the page is opened); if the header says background
+  spawns are off, no credentials were discovered and no spawn will be fulfilled.
 - A spawn request is a plain file in the conversation's workspace, so anything
   inside the container can write one — treat the workspace as trusted input, the
   same as the handover request.

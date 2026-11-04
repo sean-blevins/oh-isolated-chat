@@ -2,7 +2,7 @@
   "name": "oh-isolated-chat",
   "version": "0.1.0",
   "private": true,
-  "description": "Canvas App: the host-side home for isolated Docker conversations — promote their memory into the durable store, and fork a conversation with its full history.",
+  "description": "Canvas App: the host-side home for isolated Docker conversations — seed their memory before they start and capture it back automatically, and fork a conversation with its full history.",
   "license": "MIT",
   "type": "module",
   "scripts": {

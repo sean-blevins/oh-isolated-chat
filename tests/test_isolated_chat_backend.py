@@ -206,6 +206,222 @@ def test_missing_conversation_memory_is_not_an_error() -> None:
         assert result["tiers"]["global"]["added"] == []
 
 
+def test_key_for_profile_prefers_the_requested_profile_then_default() -> None:
+    with tempfile.TemporaryDirectory() as tmp:
+        root = make_tree(Path(tmp))
+        assert memory.key_for_profile(root, "p1") == "p1"
+        # No profile recorded (a pre-create seed) falls back to the default.
+        assert memory.key_for_profile(root, None) == "default"
+        (root / "agent-profiles").mkdir()
+        (root / "agent-profiles" / "default.json").write_text(
+            json.dumps({"id": "d1", "name": "default"})
+        )
+        assert memory.key_for_profile(root, None) == "d1"
+
+
+def test_seed_conversation_unions_the_durable_store_into_both_tiers() -> None:
+    with tempfile.TemporaryDirectory() as tmp:
+        root = make_tree(Path(tmp))
+        (root / "memory").mkdir()
+        (root / "memory" / "MEMORY.md").write_text("- durable global\n")
+        (root / "memory" / "agents" / "profile-1").mkdir(parents=True)
+        (root / "memory" / "agents" / "profile-1" / "MEMORY.md").write_text(
+            "- durable project\n"
+        )
+        hex_id = "cc11dd22ee33ff44"
+        result = memory.seed_conversation(root, hex_id, "profile-1")
+        assert result["tiers"]["global"]["seeded"] is True
+        assert result["tiers"]["profile"]["seeded"] is True
+        runtime = root / "runtime-data" / hex_id
+        assert (runtime / "persistence" / "memory" / "MEMORY.md").read_text() == (
+            "- durable global\n"
+        )
+        assert (runtime / "workspace" / ".openhands" / "memory" / "MEMORY.md").read_text() == (
+            "- durable project\n"
+        )
+        # A re-seed is a union, so it adds nothing the second time.
+        again = memory.seed_conversation(root, hex_id, "profile-1")
+        assert again["tiers"]["global"]["seeded"] is False
+        assert again["tiers"]["profile"]["seeded"] is False
+
+
+def test_capture_unions_only_changed_conversation_memory() -> None:
+    with tempfile.TemporaryDirectory() as tmp:
+        root = make_tree(Path(tmp))
+        hex_id = "aa11bb22cc33dd44"
+        write_record(
+            root, hex_id, launched_agent_profile={"agent_profile_id": "profile-1"}
+        )
+        seen: dict = {}
+        assert memory.capture(root, seen) == [hex_id]
+        assert "user prefers tabs" in (root / "memory" / "MEMORY.md").read_text()
+        # Nothing changed: no re-read, no write.
+        assert memory.capture(root, seen) == []
+        # A new line is captured on the next change.
+        source = root / "runtime-data" / hex_id / "persistence" / "memory" / "MEMORY.md"
+        source.write_text(source.read_text() + "- global: a new fact\n")
+        assert memory.capture(root, seen) == [hex_id]
+        assert "a new fact" in (root / "memory" / "MEMORY.md").read_text()
+
+
+def test_capture_skips_conversations_without_a_canvas_record() -> None:
+    """A record-less runtime dir must not leak into the default profile tier.
+
+    Canvas writes ``meta.json`` slightly after a conversation starts, while the
+    watcher polls every couple of seconds, so a seeded conversation's memory can
+    change before its launched profile is on disk. Capturing it then would fall
+    back to the default profile and cross-contaminate the default durable store.
+    """
+    with tempfile.TemporaryDirectory() as tmp:
+        root = Path(tmp) / "persistence"
+        (root / "agent-profiles").mkdir(parents=True)
+        (root / "agent-profiles" / "default.json").write_text(
+            json.dumps({"id": "default-1", "name": "default"})
+        )
+        hex_id = "aa11bb22cc33dd44"
+        project = (
+            root / "runtime-data" / hex_id / "workspace" / ".openhands" / "memory"
+        )
+        project.mkdir(parents=True)
+        (project / "MEMORY.md").write_text(
+            "- project: only the test profile owns this\n"
+        )
+
+        seen: dict = {}
+        # No Canvas record yet: nothing is captured, so the default tier stays clean.
+        assert memory.capture(root, seen) == []
+        assert not (root / "memory" / "agents" / "default-1" / "MEMORY.md").exists()
+
+        # Once Canvas records the launched profile, the same unchanged file is
+        # captured under that profile -- proving the skip was not a lost cache.
+        write_record(
+            root, hex_id, launched_agent_profile={"agent_profile_id": "profile-x"}
+        )
+        assert memory.capture(root, seen) == [hex_id]
+        assert "only the test profile owns this" in (
+            root / "memory" / "agents" / "profile-x" / "MEMORY.md"
+        ).read_text()
+        assert not (root / "memory" / "agents" / "default-1" / "MEMORY.md").exists()
+
+
+def test_durable_tier_for_path_accepts_only_the_store() -> None:
+    with tempfile.TemporaryDirectory() as tmp:
+        root = make_tree(Path(tmp))
+        assert memory.durable_tier_for_path(root, root / "memory" / "MEMORY.md") == (
+            "global",
+            "",
+        )
+        assert memory.durable_tier_for_path(
+            root, root / "memory" / "agents" / "p1" / "MEMORY.md"
+        ) == ("profile", "p1")
+        assert (
+            memory.durable_tier_for_path(
+                root, root / "runtime-data" / "aa11bb22cc33dd44" / "MEMORY.md"
+            )
+            is None
+        )
+        assert memory.durable_tier_for_path(root, root / "settings.json") is None
+
+
+def test_edit_durable_line_rewrites_the_store_and_the_conversation_copy() -> None:
+    with tempfile.TemporaryDirectory() as tmp:
+        root = make_tree(Path(tmp))
+        hex_id = "aa11bb22cc33dd44"
+        write_record(
+            root, hex_id, launched_agent_profile={"agent_profile_id": "profile-1"}
+        )
+        memory.promote(root, hex_id)
+        durable = root / "memory" / "agents" / "profile-1" / "MEMORY.md"
+        old = "- project: isolated conversations keep their own memory"
+        new = "- project: isolated conversations keep their own memory (per profile)"
+
+        result = memory.edit_durable_line(root, durable, old, new)
+        assert result["ok"] is True
+        assert result["changed"] is True
+        durable_lines = durable.read_text().splitlines()
+        assert new in durable_lines
+        assert old not in durable_lines
+        # The conversation's own copy changed too, so capture cannot put the old
+        # line back on its next pass.
+        copy = (
+            root
+            / "runtime-data"
+            / hex_id
+            / "workspace"
+            / ".openhands"
+            / "memory"
+            / "MEMORY.md"
+        )
+        copy_lines = copy.read_text().splitlines()
+        assert new in copy_lines
+        assert old not in copy_lines
+        assert memory.capture(root, {}) == []
+
+        # Editing a line to itself is a no-op.
+        assert memory.edit_durable_line(root, durable, new, new)["changed"] is False
+
+
+def test_delete_durable_line_is_scoped_to_the_tier_and_profile() -> None:
+    with tempfile.TemporaryDirectory() as tmp:
+        root = Path(tmp) / "persistence"
+        project = Path("workspace") / ".openhands" / "memory" / "MEMORY.md"
+        global_rel = Path("persistence") / "memory" / "MEMORY.md"
+
+        def put(path: Path, text: str) -> None:
+            path.parent.mkdir(parents=True, exist_ok=True)
+            path.write_text(text)
+
+        for hex_id, profile in (
+            ("aa11bb22cc33dd44", "p1"),
+            ("bb11cc22dd33ee44", "p2"),
+        ):
+            write_record(
+                root, hex_id, launched_agent_profile={"agent_profile_id": profile}
+            )
+            put(root / "runtime-data" / hex_id / project, "- shared project line\n")
+            put(root / "runtime-data" / hex_id / global_rel, "- shared global line\n")
+        put(root / "memory" / "agents" / "p1" / "MEMORY.md", "- shared project line\n")
+        put(root / "memory" / "agents" / "p2" / "MEMORY.md", "- shared project line\n")
+        put(root / "memory" / "MEMORY.md", "- shared global line\n")
+
+        # Deleting from p1's tier reaches p1's own conversation copy only.
+        p1 = root / "memory" / "agents" / "p1" / "MEMORY.md"
+        result = memory.delete_durable_line(root, p1, "- shared project line")
+        assert result["ok"] is True and result["changed"] is True
+        assert p1.read_text().strip() == ""
+        assert (root / "memory" / "agents" / "p2" / "MEMORY.md").read_text().strip() == (
+            "- shared project line"
+        )
+        assert (
+            root / "runtime-data" / "aa11bb22cc33dd44" / project
+        ).read_text().strip() == ""
+        assert (
+            root / "runtime-data" / "bb11cc22dd33ee44" / project
+        ).read_text().strip() == "- shared project line"
+
+        # A global line reaches every conversation, whatever the profile.
+        memory.delete_durable_line(
+            root, root / "memory" / "MEMORY.md", "- shared global line"
+        )
+        assert (
+            root / "runtime-data" / "aa11bb22cc33dd44" / global_rel
+        ).read_text().strip() == ""
+        assert (
+            root / "runtime-data" / "bb11cc22dd33ee44" / global_rel
+        ).read_text().strip() == ""
+
+
+def test_durable_state_reports_line_and_char_counts() -> None:
+    with tempfile.TemporaryDirectory() as tmp:
+        root = make_tree(Path(tmp))
+        (root / "memory").mkdir()
+        (root / "memory" / "MEMORY.md").write_text("- a\n- b\n")
+        files = state.durable_state(root)
+        global_file = next(file for file in files if file["key"] == "global")
+        assert global_file["lines"] == 2
+        assert global_file["chars"] == len("- a\n- b\n")
+
+
 def test_conversation_title_prefers_the_stored_title() -> None:
     assert persistence.conversation_title({"title": "  Save the thing  "}) == "Save the thing"
 
@@ -389,6 +605,23 @@ def test_seed_contributes_the_handover_skill() -> None:
         assert "conversation.json" in text  # the link back to the chain
 
 
+def test_seed_contributes_the_memory_skill() -> None:
+    with tempfile.TemporaryDirectory() as tmp:
+        root = make_tree(Path(tmp))
+        plugin = hooks.seed(root, "cc11dd22ee33ff44")
+        skill = plugin / hooks.MEMORY_SKILL_REL
+        assert skill.is_file()
+        text = skill.read_text()
+        assert text.startswith("---")
+        assert "name: memory" in text
+        # It names both tiers, frames memory as a small curated reference card,
+        # and routes evolving state to the handover artifact instead.
+        assert ".openhands/memory/MEMORY.md" in text
+        assert "reference card" in text
+        assert "handover.md" in text
+        assert "append-only union" in text
+
+
 def test_seed_writes_an_executable_hook_script() -> None:
     with tempfile.TemporaryDirectory() as tmp:
         root = make_tree(Path(tmp))
@@ -427,6 +660,31 @@ def test_read_agent_settings_returns_the_stored_source_or_none() -> None:
         assert persistence.read_agent_settings(root) == {"llm": {"model": "x"}}
         (root / "settings.json").write_text(json.dumps({"agent_settings": None}))
         assert persistence.read_agent_settings(root) is None
+
+
+def test_read_load_memory_reads_the_host_setting_or_none() -> None:
+    with tempfile.TemporaryDirectory() as tmp:
+        root = make_tree(Path(tmp))
+        assert persistence.read_load_memory(root) is None
+        (root / "settings.json").write_text(
+            json.dumps({"agent_settings": {"agent_context": {"load_memory": True}}})
+        )
+        assert persistence.read_load_memory(root) is True
+        # A non-boolean (or a settings file without the field) is "unknown".
+        (root / "settings.json").write_text(
+            json.dumps({"agent_settings": {"agent_context": {"load_memory": "yes"}}})
+        )
+        assert persistence.read_load_memory(root) is None
+
+
+def test_state_reports_the_load_memory_setting() -> None:
+    with tempfile.TemporaryDirectory() as tmp:
+        root = make_tree(Path(tmp))
+        assert state.state(root)["load_memory"] is None
+        (root / "settings.json").write_text(
+            json.dumps({"agent_settings": {"agent_context": {"load_memory": False}}})
+        )
+        assert state.state(root)["load_memory"] is False
 
 
 def _write_handover(root: Path, hex_id: str, **fields: object) -> Path:
@@ -526,6 +784,26 @@ def test_prepare_seeds_the_successor_writes_the_artifact_and_links_the_chain() -
         assert status["requested"] is False
         assert status["successor"] == successor_hex
         assert status["doc"] is True
+
+
+def test_prepare_seeds_the_successors_memory_from_the_launch_profile() -> None:
+    with tempfile.TemporaryDirectory() as tmp:
+        root = make_tree(Path(tmp))
+        hex_id = "aa11bb22cc33dd44"
+        (root / "memory" / "agents" / "next-profile").mkdir(parents=True)
+        (root / "memory" / "agents" / "next-profile" / "MEMORY.md").write_text(
+            "- project: continue from the handover\n"
+        )
+        successor = "99998888-7777-6666-5555-444433332222"
+
+        handover.prepare(root, hex_id, successor, agent_profile_id="next-profile")
+
+        successor_hex = successor.replace("-", "")
+        project = (
+            root / "runtime-data" / successor_hex / "workspace"
+            / ".openhands" / "memory" / "MEMORY.md"
+        )
+        assert project.read_text() == "- project: continue from the handover\n"
 
 
 def test_prepare_clears_the_force_marker_so_it_does_not_refire() -> None:
@@ -847,6 +1125,33 @@ def test_spawn_worker_seeds_creates_and_starts_a_goal() -> None:
         assert entry["goal"] is True and entry["done"] is False
 
 
+def test_spawn_worker_seeds_memory_from_the_resolved_profile() -> None:
+    with tempfile.TemporaryDirectory() as tmp:
+        root = make_tree(Path(tmp))
+        parent = "aa11bb22cc33dd44"
+        write_record(
+            root, parent, launched_agent_profile={"agent_profile_id": "parent-profile"}
+        )
+        # The durable tier that profile owns is seeded into the worker before the
+        # create, so its first run already carries the memory.
+        (root / "memory" / "agents" / "parent-profile").mkdir(parents=True)
+        (root / "memory" / "agents" / "parent-profile" / "MEMORY.md").write_text(
+            "- project: run it with make\n"
+        )
+        config = spawner.SpawnerConfig(agent_server_url="http://x", session_key="k")
+        spawner.spawn_worker(
+            root,
+            parent,
+            spawner.SpawnRequest(task="do it"),
+            config,
+            FakeAgentServer(),
+            reserve=lambda: "11111111-2222-3333-4444-555555555555",
+        )
+        worker = root / "runtime-data" / "11111111222233334444555555555555"
+        seeded = worker / "workspace" / ".openhands" / "memory" / "MEMORY.md"
+        assert seeded.read_text() == "- project: run it with make\n"
+
+
 def test_spawn_worker_can_opt_out_of_goal() -> None:
     with tempfile.TemporaryDirectory() as tmp:
         root = make_tree(Path(tmp))
@@ -987,6 +1292,26 @@ def test_watcher_scan_creates_a_worker_then_is_idempotent() -> None:
         # Nothing left to do, and no second create.
         assert watcher.scan_once() == []
         assert len(client.payloads) == 1
+
+
+def test_watcher_captures_memory_without_a_spawner_config() -> None:
+    with tempfile.TemporaryDirectory() as tmp:
+        root = make_tree(Path(tmp))
+        hex_id = "aa11bb22cc33dd44"
+        write_record(
+            root, hex_id, launched_agent_profile={"agent_profile_id": "profile-1"}
+        )
+        # No config: spawns are off, but capture still runs. No Agent Server
+        # client is built, and scan_once does nothing.
+        watcher = spawner.Watcher(root)
+        assert watcher.client is None
+        assert watcher.scan_once() == []
+        assert watcher.capture_memory() == [hex_id]
+        assert watcher.capture_memory() == []
+        status = watcher.status()
+        assert status["enabled"] is False
+        assert status["captured"] == 1
+        assert status["last_capture"] is not None
 
 
 def test_watcher_retries_then_sets_a_failing_request_aside() -> None:

@@ -11,35 +11,40 @@ from .server import Handler
 from .spawner import SpawnerConfigError, Watcher, load_config
 
 
-def start_watcher(root: Path, data_dir: Path) -> Watcher | None:
-    """Start the background spawner, or return None when it cannot run.
+def start_watcher(root: Path, data_dir: Path) -> Watcher:
+    """Start the background watcher: memory capture always, spawns when possible.
 
-    The spawner needs Agent Server access to create a conversation. It discovers
-    that from its parent process (with an optional ``spawner.json`` override); if
-    there is nothing to discover, spawns are disabled -- the rest of the app is
-    unaffected and ``/api/spawner`` reports why.
+    The watcher has two jobs. Memory capture needs nothing but the host
+    filesystem -- a conversation's ``MEMORY.md`` is already bind-mounted into its
+    runtime directory -- so it always runs. Spawning a conversation needs Agent
+    Server access, discovered from the parent process (with an optional
+    ``spawner.json`` override); when there is nothing to discover, spawns are
+    disabled and ``/api/spawner`` reports why, but capture keeps working.
     """
     try:
         config = load_config(data_dir, root)
     except SpawnerConfigError as exc:
-        print(f"[oh-isolated-chat] spawner disabled: {exc}", flush=True)
-        return None
+        print(f"[oh-isolated-chat] spawns disabled: {exc}", flush=True)
+        config = None
     if config is None:
         print(
-            "[oh-isolated-chat] spawner disabled: no Agent Server credentials "
-            "discovered (set <data-dir>/spawner.json to enable)",
+            "[oh-isolated-chat] spawns disabled: no Agent Server credentials "
+            "discovered (set <data-dir>/spawner.json to enable); memory capture "
+            "still on",
             flush=True,
         )
-        return None
     watcher = Watcher(
         root,
         config,
         logger=lambda message: print(f"[oh-isolated-chat] {message}", flush=True),
     )
     watcher.start()
+    target = (
+        f"via {config.agent_server_url}" if config is not None else "(capture only)"
+    )
     print(
-        f"[oh-isolated-chat] spawner watching {root / 'runtime-data'}/*/workspace/"
-        f".openhands/spawn via {config.agent_server_url}",
+        f"[oh-isolated-chat] watcher on {root / 'runtime-data'}/* "
+        f"(memory capture + spawns {target})",
         flush=True,
     )
     return watcher

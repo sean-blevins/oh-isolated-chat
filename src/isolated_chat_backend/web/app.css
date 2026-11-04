@@ -34,6 +34,7 @@ pre { margin: 0; padding: 12px; border: 1px solid var(--line); border-radius: 8p
 .tier { color: var(--muted); font-size: 12px; }
 .name { font-weight: 600; }
 .note { color: var(--muted); }
+.note.warn { color: #a5650a; }
 .chips { display: flex; flex-wrap: wrap; gap: 6px; margin-top: 6px; }
 .chip { padding: 1px 8px; border: 1px solid var(--line); border-radius: 999px; font-size: 11px; color: var(--muted); }
 .chip.warn { border-color: #d08a2c; color: #a5650a; background: #fdf3e3; }
@@ -45,3 +46,15 @@ pre { margin: 0; padding: 12px; border: 1px solid var(--line); border-radius: 8p
 .toggle.live { color: var(--accent); }
 .toggle.warn { color: #a5650a; }
 tr.child .name { font-weight: 500; }
+/* The durable store's per-line curation: a scroll box per file, each line with
+   Edit/Delete controls that stay quiet until the row is hovered. */
+.memfile { border: 1px solid var(--line); border-radius: 8px; overflow: auto; max-height: 320px; margin: 0 0 10px; }
+.memline { display: flex; align-items: baseline; gap: 8px; padding: 2px 10px; }
+.memline.blank { height: 6px; padding: 0; }
+.memtext { flex: 1; white-space: pre-wrap; word-break: break-word; font: 12px/1.6 ui-monospace, SFMono-Regular, Menlo, monospace; }
+.memtext.heading { font-weight: 600; }
+.memactions { display: flex; gap: 6px; flex: 0 0 auto; opacity: .35; }
+.memline:hover .memactions, .memline.editing .memactions { opacity: 1; }
+.memactions button { padding: 1px 8px; font-size: 11px; border-radius: 6px; }
+.memline.editing { background: color-mix(in srgb, var(--accent) 12%, transparent); }
+.memline.editing input { flex: 1; font: 12px/1.6 ui-monospace, SFMono-Regular, Menlo, monospace; padding: 2px 6px; border: 1px solid var(--line); border-radius: 6px; background: var(--surface); color: var(--ink); }

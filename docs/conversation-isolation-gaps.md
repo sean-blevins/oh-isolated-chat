@@ -4,7 +4,7 @@
 half and ISO-08's fork/branch half (§3.3) have implemented fixes; everything
 else is unfixed.
 **Date:** 2026-10-20 (ISO-03 fix + E2E gate: 2026-10-21; memory seeding +
-host-side fork: 2026-10-21).
+host-side fork: 2026-10-21; button-free memory capture: 2026-11-04).
 **Scope:** OpenHands Agent Canvas + `software-agent-sdk` Agent Server, when the
 active backend runs conversations in **isolated (Docker) mode** — one container
 per conversation, control plane on the host, `conversation_runtime: "docker"`.
@@ -142,7 +142,7 @@ wrong or misleading; **minor** = inconsistency / papercut.
 | ISO-04 | In-conversation "Show plugins" reports plugins that were never loaded                                                                         | C        | major                                                                            |
 | ISO-05 | `shouldShowPlugins` gating derived from a client-side snapshot                                                                                | C        | minor                                                                            |
 | ISO-06 | `cobol-modernization` (+2) published in the repo but absent from the marketplace manifest                                                     | upstream | major                                                                            |
-| ISO-07 | Memory: both tiers per-conversation; user tier never written; toggle inert                                                                    | A        | blocker — durable seed + host-side promotion implemented, §3.3                   |
+| ISO-07 | Memory: both tiers per-conversation; user tier never written; toggle inert                                                                    | A        | blocker — durable seed + automatic capture implemented, §3.3                      |
 | ISO-08 | Branch/fork → hardcoded 501, no UI gating                                                                                                     | B        | major — **fixed** for fork/branch, §3.3; `switch_llm`/`switch_profile` still 501 |
 | ISO-09 | `switch_llm` / `switch_profile` → hardcoded 501, no UI gating                                                                                 | B        | major — a fork can pick a profile (§3.3); in-place switch is still 501           |
 | ISO-10 | `credential-bindings` → hardcoded 501                                                                                                         | B        | minor                                                                            |
@@ -314,7 +314,8 @@ _user_plugin_sources`), then `117 passed, 6 deselected` for the whole
 Still open nearby: the picker's host-absolute coordinates (ISO-02, S6), the
 manifest gap (ISO-01/06), the "Show plugins" lie (ISO-04), project-tier plugins
 (ISO-11/12 — the workspace is empty, so `include_project` still finds nothing),
-and memory (ISO-07 — seeding alone has no writeback).
+and memory (ISO-07 — seeding alone has no writeback; the app now supplies one
+automatically, §3.3).
 
 ### 3.2 — What this teaches about the general seam
 
@@ -346,8 +347,9 @@ and memory (ISO-07 — seeding alone has no writeback).
    keep the inline path for small, request-scoped content.
 6. **Seeding is not sync.** For plugins one-way is correct (the container has no
    authoritative writes). For memory the user tier _is_ written inside the
-   container, so S1 for memory is only half a solution until a writeback rule
-   exists (ISO-07).
+   container, so S1 for memory is only half a solution without a writeback rule
+   (ISO-07) — the app now supplies one as an automatic change-detection capture
+   (§3.3).
 
 ### 3.3 — Implemented fix: durable memory seeding + host-side fork (ISO-07 / ISO-08)
 
@@ -375,15 +377,18 @@ profile launch, so Canvas records nothing for it — absence means `default`, no
 dedupe, order-preserving) and idempotent, so restarts after idle eviction are
 safe. It never triggers on eviction or delete.
 
-**ISO-07, writeback half — promote on request.** §3.2's item 6 is the reason
-this is a separate, explicit step: the user tier _is_ written inside the
-container, so a one-way seed needs a writeback rule. The rule is a host action
-that unions the conversation's own `MEMORY.md` files into the durable store —
-same line-union semantics, never rewriting the conversation's copy — triggered
-by the user, not by eviction or deletion. It lives in a Canvas App
-(`oh-isolated-chat`, the repo this document ships in), because the
-host-side half of memory is platform code and an App is the supported seam for
-host-side behavior with a user-facing trigger.
+**ISO-07, writeback half — automatic capture.** §3.2's item 6 is the reason this
+exists at all: the user tier _is_ written inside the container, so a one-way seed
+needs a writeback rule. The rule is a host action that unions the conversation's
+own `MEMORY.md` files into the durable store — same line-union semantics, never
+rewriting the conversation's copy. It runs **automatically**, not on a user
+trigger: the app's background watcher keeps a `(mtime_ns, size)` fingerprint per
+`MEMORY.md` and captures a file the moment it changes, so the store tracks the
+conversations without a Promote button. Idle eviction and deletion still do not
+trigger a special pass (by the time a conversation stops changing, its memory is
+already in the store). It lives in a Canvas App (`oh-isolated-chat`, the repo this
+document ships in), because the host-side half of memory is platform code and an
+App is the supported seam for host-side behavior.
 
 **ISO-08 — fork/branch on the host.** `fork` was 501 for the same class-B reason
 as `switch_llm`: the state to copy is host-side. The container's persisted
@@ -501,13 +506,15 @@ the dev store, so also invisible).
 Only working persistent-memory route today: a host/remote **HTTP** memory MCP
 server, reachable because of `--add-host host.docker.internal:host-gateway`.
 
-**Update (2026-10-21):** both tiers now have a durable store and both halves of
-the lifecycle are implemented — the Agent Server seeds the durable store into
-the runtime dirs at container build, and a host-side, user-triggered promotion
-unions the conversation's own files back into it. The project tier is keyed by
-the profile the conversation was launched with, not the active profile. See
-§3.3. Still open: the `load_memory` toggle's interaction with the seed, and the
-`docs`-level statement of the writeback rule.
+**Update (2026-10-21; writeback reworked 2026-11-04):** both tiers now have a
+durable store and both halves of the lifecycle are implemented. The Agent Server
+seeds the durable store into the runtime dirs at container build, and the app
+seeds it again for the conversations it owns (before the container starts, keyed
+by the launch profile). The **writeback** half is now an automatic capture: a
+host-side watcher unions the conversation's own files back into the durable store
+as they change, with no user trigger. The project tier is keyed by the profile
+the conversation was launched with, not the active profile. See §3.3. Still open:
+the `load_memory` toggle's interaction with the seed.
 
 ### ISO-08 / ISO-09 / ISO-10 — Hardcoded 501s with no UI awareness
 
@@ -658,8 +665,8 @@ writes into a host-mounted directory.
 | Picker-attached plugin                  | works      | 500 host path                                               | loud       |
 | Git-coordinate-attached plugin          | works      | **works** (container clones)                                | —          |
 | In-conversation "Show plugins"          | accurate   | **lies**                                                    | silent     |
-| Persistent memory (both tiers)          | works      | **works** (durable seed + host-side promotion, §3.3)        | —          |
-| `load_memory` toggle                    | works      | honoured but inert                                          | silent     |
+| Persistent memory (both tiers)          | works      | **works** (durable seed + automatic capture, §3.3)          | —          |
+| `load_memory` toggle                    | works      | honoured; seeds load only when on, else inert               | silent     |
 | Project skills                          | works      | nothing                                                     | **silent** |
 | Host hooks                              | works      | nothing                                                     | **silent** |
 | Attach host folder / repo               | works      | rejected by design                                          | loud       |
@@ -720,7 +727,7 @@ decision):
 
 | #   | Strategy                                                                                                                                        | Kills                                                                                                          | Notes                                                                      |
 | --- | ----------------------------------------------------------------------------------------------------------------------------------------------- | -------------------------------------------------------------------------------------------------------------- | -------------------------------------------------------------------------- |
-| S1  | **Seed/snapshot** ambient user state into the conversation persistence dir before `docker run`                                                  | ISO-03 (**implemented, §3.1**), ISO-12, ISO-13; ISO-07 (**implemented with a host-side promotion step, §3.3**) | One pipeline, one-way copy, hardened mounts untouched                      |
+| S1  | **Seed/snapshot** ambient user state into the conversation persistence dir before `docker run`                                                  | ISO-03 (**implemented, §3.1**), ISO-12, ISO-13; ISO-07 (**implemented: seed + automatic capture, §3.3**)      | One pipeline, one-way copy, hardened mounts untouched                      |
 | S2  | **Inline at request time** (the skills pattern) — resolve on the host during validation and forward content                                     | ~~ISO-03 (not needed: skills already do this; plugin trees make it unattractive)~~                             | Symmetric with skills; but plugins carry trees, parameters, secrets, hooks |
 | S3  | **Forward durable references + host-side resolution** (mirror the `secrets` intercept) for profiles / provider connections                      | ISO-09 (± ISO-10)                                                                                              | `fork` (ISO-08) was the same shape of problem and is **implemented, §3.3** |
 | S4  | **Isolation capability descriptor** — one server-provided source of truth that every UI surface reads                                           | ISO-15, ISO-16, ISO-08/09/11 gating                                                                            | Hide vs annotate is a UX decision per surface                              |
@@ -745,10 +752,11 @@ S4/S5 are the UI-truth half and probably belong together.
    Project-tier memory is unsolvable without a repo/workspace, so it needs an
    explicit story either way.
    _Answered 2026-10-21 (§3.3):_ built-in persistence, as **durable seed +
-   explicit host-side promotion**, with the project tier keyed by the launched
+   automatic host-side capture**, with the project tier keyed by the launched
    **agent profile** rather than by a repo (so it works with an empty
-   `/workspace`). Open: whether promotion should also be reachable from
-   conversation deletion/eviction (currently deliberately not).
+   `/workspace`). Capture runs on a change-detection poll, so it is not
+   separately reachable from conversation deletion/eviction — deliberately, and
+   no longer a question.
 3. **Isolation UX** — hide, disable-with-reason, or annotate? Candidates: Branch,
    change-model/profile, workspace picker, memory toggle, "Show plugins",
    plugin picker.
