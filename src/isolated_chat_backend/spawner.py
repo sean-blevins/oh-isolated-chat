@@ -8,9 +8,10 @@ would land in the parent's container namespace, ``Errno 13 Permission denied``).
 
 This module is the "equivalent launcher supplied by the backend hosting the
 parent" that the tool's docstring names. It is a small HTTP endpoint -- reachable
-from inside a conversation container at ``host.docker.internal:<port>`` -- that
-creates a **top-level** worker conversation through the Agent Server, so the
-worker is Canvas-openable and the spawn needs no browser page open.
+from the Agent Server process at its own loopback address, the same address the
+tool's default launcher uses -- that creates a **top-level** worker conversation
+through the Agent Server, so the worker is Canvas-openable and the spawn needs no
+browser page open.
 
 The backend is launched by the Agent Server but inherits none of its ``OH_*``
 environment, so by default it cannot call the Agent Server. Rather than make the
@@ -102,9 +103,11 @@ class SpawnerConfig:
     """The knobs for background spawns. Every field has a working default.
 
     ``agent_server_url`` and ``session_key`` are normally discovered from the
-    Agent Server process. ``public_base_url`` is how the *container* reaches this
-    endpoint; it defaults to the Docker host gateway, which the runtime already
-    adds a host entry for.
+    Agent Server process. ``public_base_url`` is how the *child-launch tool*
+    reaches this endpoint; it defaults to the Agent Server's own host with this
+    listener's port (loopback), because the tool runs in the Agent Server's
+    namespace. Set it explicitly only when the tool reaches the endpoint by a
+    different name (a fixed ingress, a container host).
     """
 
     agent_server_url: str = DEFAULT_AGENT_SERVER_URL
@@ -122,11 +125,32 @@ class SpawnerConfig:
     request_timeout: float = DEFAULT_REQUEST_TIMEOUT
 
     @property
+    def reachable_host(self) -> str:
+        """The host the child-launch tool uses to reach this endpoint.
+
+        The ``start_child_conversation`` executor is an **in-process caller of
+        the Agent Server** (upstream ``export_session_api_key`` names it as
+        exactly that), and this backend is a child of that process, so the
+        endpoint is reachable at the Agent Server's own address -- loopback,
+        precisely like the tool's default
+        ``{OH_INTERNAL_SERVER_URL}/api/conversations/{parent}/children``.
+
+        ``host.docker.internal`` is *not* this address. From the Agent Server's
+        namespace it can resolve to the Docker gateway (``172.17.0.1``), where
+        nothing listens, so the tool's connect is refused. The host is taken
+        from the discovered ``agent_server_url``; ``_normalize_host`` rewrites a
+        wildcard bind to loopback, the same rewrite the Agent Server applies to
+        build ``OH_INTERNAL_SERVER_URL``.
+        """
+        host = urlparse(self.agent_server_url).hostname or "127.0.0.1"
+        return _normalize_host(host)
+
+    @property
     def base_url(self) -> str:
-        """The origin a container should use to reach this endpoint."""
+        """The origin the child-launch tool should use to reach this endpoint."""
         if self.public_base_url:
             return self.public_base_url.rstrip("/")
-        return f"http://host.docker.internal:{self.listen_port}"
+        return f"http://{self.reachable_host}:{self.listen_port}"
 
     def spawn_url(
         self,

@@ -645,12 +645,22 @@ def spawner_config(**overrides) -> spawner.SpawnerConfig:
     return spawner.config_from_dict(base)
 
 
-def test_spawner_config_defaults_public_base_url_to_the_docker_gateway() -> None:
+def test_spawner_config_defaults_the_base_url_to_the_agent_server_host() -> None:
     config = spawner_config()
-    assert config.base_url == "http://host.docker.internal:59777"
+    # The child-launch tool runs in the Agent Server's namespace, so the
+    # endpoint's reachable host is the Agent Server's own host -- here the
+    # loopback address discovered from its argv -- not the Docker gateway.
+    assert config.reachable_host == "127.0.0.1"
+    assert config.base_url == "http://127.0.0.1:59777"
     assert config.spawn_url("aa11bb22cc33dd44") == (
-        "http://host.docker.internal:59777/api/spawn?campaign=aa11bb22cc33dd44"
+        "http://127.0.0.1:59777/api/spawn?campaign=aa11bb22cc33dd44"
     )
+
+
+def test_spawner_config_rewrites_a_wildcard_agent_server_bind_to_loopback() -> None:
+    config = spawner_config(agent_server_url="http://0.0.0.0:18000")
+    assert config.reachable_host == "127.0.0.1"
+    assert config.base_url == "http://127.0.0.1:59777"
 
 
 def test_spawner_config_prefers_an_explicit_public_base_url() -> None:

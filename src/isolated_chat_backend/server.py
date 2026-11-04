@@ -13,9 +13,10 @@ Routes:
   POST /api/clear     debug-only: empty the durable store
   GET  /, /app.css, /app.js   the browser view served from ``web/``
 
-A second listener (:class:`SpawnHandler`) serves the container-reachable spawn
-route; its configuration is discovered from the Agent Server by default, with an
-optional ``spawner.json`` override -- see ``spawner.py``.
+A second listener (:class:`SpawnHandler`) serves the spawn route the
+``start_child_conversation`` tool POSTs to; its configuration is discovered from
+the Agent Server by default, with an optional ``spawner.json`` override -- see
+``spawner.py``.
 
 Relative asset URLs in the view resolve against the bridge's ingress mount, so
 the page and its assets stay inside the authenticated path.
@@ -295,12 +296,14 @@ class Handler(BaseHTTPRequestHandler):
 
 
 class SpawnHandler(Handler):
-    """The container-reachable listener for the ``start_child_conversation`` tool.
+    """The listener the ``start_child_conversation`` tool POSTs to.
 
-    Reachable from inside a conversation container at ``host.docker.internal``
-    (the runtime adds that host entry), it creates a top-level worker through the
-    Agent Server and replies with the tool's response shape. No browser page is
-    involved, so a spawn runs entirely in the background.
+    The tool executes in the Agent Server process (an in-process caller), and
+    this backend is that process's child, so the tool reaches this listener over
+    the Agent Server's own loopback -- the same address the tool's default
+    launcher uses. It creates a top-level worker through the Agent Server and
+    replies with the tool's response shape. No browser page is involved, so a
+    spawn runs entirely in the background.
     """
 
     def do_GET(self) -> None:  # noqa: N802 - BaseHTTPRequestHandler API

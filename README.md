@@ -270,24 +270,35 @@ Place it at **`<data-dir>/spawner.json`**, where `<data-dir>` is the managed
 backend's data directory (the app page's *Background orchestrator* status shows
 the exact path and whether the config was discovered or read from a file).
 `session_key_path` may be used instead of `session_key`. `listen_port` should be
-stable, because it is baked into the launch URL; the default `public_base_url` is
-`http://host.docker.internal:<listen_port>`, which the Docker runtime already
-resolves (it adds a `host.docker.internal` host entry).
+stable, because it is baked into the launch URL.
+
+The default `public_base_url` is the **Agent Server's own host with this
+listener's port** — normally `http://127.0.0.1:<listen_port>`. That is the right
+address because the `start_child_conversation` executor is an *in-process caller
+of the Agent Server* (upstream `export_session_api_key` names it as such), and
+the backend is a child of that process, so the tool reaches the endpoint over the
+same loopback the tool's default launcher uses. `host.docker.internal` is **not**
+that address: from the Agent Server's namespace it can resolve to the Docker
+gateway (`172.17.0.1`), where nothing listens, and the tool's connect is refused.
+Set `public_base_url` only when the tool reaches the endpoint by a different name
+(a fixed ingress, or a deployment where the endpoint really is elsewhere).
 
 With config resolved, the backend:
 
-1. Starts a second HTTP listener (the **spawn endpoint**) bound for container
-   reachability, alongside its normal ingress-bound one.
+1. Starts a second HTTP listener (the **spawn endpoint**) bound to `0.0.0.0`, so
+   it is reachable on the Agent Server's loopback (where the tool runs) and on any
+   container path a deployment might add.
 2. On **Start campaign**, takes the agent profile (and, for OpenHands, the LLM
    profile) you chose in the page, creates a dedicated orchestrator profile for
    the campaign — the user's normal tools plus `start_child_conversation` bound
    to `…/api/spawn?campaign=<id>&profile=<agent>&llm=<llm>` — and starts a
    top-level conversation on it. **One profile is created per campaign**, so each
    campaign can run workers on a different base agent profile.
-3. When that agent calls the tool, the container POSTs to the spawn endpoint.
-   The backend reserves an id, seeds the hook plugin, and creates a **top-level
-   worker** with `initial_message = task`, so the worker starts running inside
-   the create call. No browser page is involved, and no page needs to be open.
+3. When that agent calls the tool, the tool POSTs to the spawn endpoint from the
+   Agent Server process. The backend reserves an id, seeds the hook plugin, and
+   creates a **top-level worker** with `initial_message = task`, so the worker
+   starts running inside the create call. No browser page is involved, and no page
+   needs to be open.
 
 Because the request body carries no parent id, the campaign and the worker's
 agent profile travel in the launch URL as query tokens — which is what the
@@ -404,7 +415,7 @@ bridge (`canvas_app_backend_bridge_v1`, released in Agent Server 1.56.0) and
 | Action  | Needs                                                                                                                              |
 | ------- | ---------------------------------------------------------------------------------------------------------------------------------- |
 | Start   | The Canvas App backend bridge, a Docker-runtime Agent Server, and a persisted `settings.json` with `agent_settings` to launch from. |
-| Start campaign | Nothing to configure: the backend discovers the Agent Server URL and session key from its parent process (with an optional `spawner.json` override), and a container image whose agent can reach `host.docker.internal`. |
+| Start campaign | Nothing to configure: the backend discovers the Agent Server URL and session key from its parent process (with an optional `spawner.json` override). The spawn endpoint is reached over the Agent Server's own loopback, so no container networking is involved. |
 | Promote | Nothing server-side to run it — it reads the conversation's files and writes the host store. Its **effect** (a new isolated conversation starting from the promoted memory) needs an Agent Server that seeds the durable store at container build. |
 | Fork    | Agent Server with the host-side Docker fork route; a stock release answers `501`.                                                   |
 
@@ -493,4 +504,4 @@ must accept it once. The durable fix is a certificate the browser already trusts
   they are Linux-only by default; a non-Linux host needs the optional
   `spawner.json` with the Agent Server URL and session key. Each campaign
   consumes one agent-profile slot (the launch URL is per campaign), and the
-  spawn listener must be reachable from the container at `host.docker.internal`.
+  spawn listener is reached over the Agent Server's own loopback.
