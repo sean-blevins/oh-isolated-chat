@@ -6,18 +6,17 @@ things a container cannot do for itself.
 Four actions today:
 
 - **Start a seeded conversation** — create a conversation the app owns and seed
-  a hook plugin **and memory** into it before it starts, so the container's first
-  run already has the hook and the memory the launch profile owns (the app-side
-  answer to host hooks never loading, ISO-13, and the host half of ISO-07).
-- **Memory** is a two-way loop with no button: the app **seeds** a conversation's
-  runtime memory from the durable host store before it starts, and a backend
-  watcher **captures** the conversation's memory back into that store as it
-  changes. See *Memory: seed and capture* below.
+  a hook plugin into it before it starts, so the container's first run already
+  has the hook (the app-side answer to host hooks never loading, ISO-13).
+- **Notes** are a two-way loop with no button: the app **injects** the durable
+  host store as a launch suffix, and a backend watcher **captures** the
+  conversation's Notes back into the store as it changes. See *Notes: inject and
+  capture* below.
 - **Fork** — copy a conversation's full history and state into a new
   conversation (ISO-08), on the source's LLM profile or on another one picked
   per row.
 - **Clear the durable store** — debug only, and removed before any release: drop
-  every captured line, so a new conversation starts with no memory.
+  every captured line, so a new conversation starts with no Notes.
 
 A fifth runs without any page: a conversation's agent can **spawn** another
 top-level conversation by writing a request file into its workspace; a backend
@@ -28,29 +27,33 @@ worker's result back into the spawning conversation when it finishes. See
 ## Why an app
 
 The original isolated-runtime gaps ([`docs/conversation-isolation-gaps.md`](docs/conversation-isolation-gaps.md))
-are mostly Agent Server contracts: memory seeding, forking, `switch_llm`,
+are mostly Agent Server contracts: durable-context seeding, forking, `switch_llm`,
 `credential-bindings`, workspace attach, hooks. Those belong upstream, and the
-Agent Server now owns the two the app needs — seeding durable memory at
+Agent Server now owns the two the app needs — seeding durable context at
 container build, and forking a persisted conversation on the host.
 
 What remains host-side is the _trigger_. A conversation runs in its own
-container and can only see its own three mounts: it can write its own memory,
-but it can never write the host's durable store — that is the whole point of the
+container and can only see its own three mounts: it can write its own files, but
+it can never write the host's durable store — that is the whole point of the
 isolation. A Canvas App is the supported seam for host-side behavior with a
 user-facing trigger, so that is where these actions live. The page is a control
 plane over isolated conversations, not a chat UI.
 
-There is no "pull" for memory: a conversation's memory is already host-visible,
-because its runtime directory is a bind mount. Capture reads the conversation's
-`MEMORY.md` files straight off disk and unions them into the durable store; seed
-goes the other way, unioning the durable store into the files before the
-container starts.
+This app keeps its own durable store, called **Notes**, deliberately separate
+from OpenHands' `MEMORY.md` machinery (which the SDK loads through
+`AgentContext.load_memory`, capped at ~6000 characters and truncated from the
+top). Notes has its own name, its own injection path, its own write/capture
+path, and its own 32 KiB budget. There is no "pull" for Notes: a conversation's
+`NOTES.md` files are already host-visible, because its runtime directory is a
+bind mount. Capture reads them straight off disk and unions them into the
+durable store; nothing is copied the other way, because the store reaches a
+conversation as injection instead.
 
 ## Where each gap is handled
 
 | Gap                                                   | Where it is fixed                                         | Status here                                                                       |
 | ----------------------------------------------------- | --------------------------------------------------------- | --------------------------------------------------------------------------------- |
-| ISO-07 memory: durable seed, never written back       | Agent Server seeds at container build; this app seeds *and* captures | hosted                                                                            |
+| ISO-07 memory: durable seed, never written back       | Agent Server seeds at container build; this app injects Notes as a launch suffix *and* captures them | hosted                                                                            |
 | ISO-08 branch/fork → 501                              | Agent Server forks the persisted conversation (host side) | hosted                                                                            |
 | ISO-09 `switch_llm` / `switch_profile` → 501          | Agent Server contract                                     | pending (a fork picks a profile; an isolated conversation cannot switch in place) |
 | ISO-10 `credential-bindings` → 501                    | Agent Server contract                                     | pending                                                                           |
@@ -59,14 +62,22 @@ container starts.
 | ISO-19 `events/search` drops container-written events | Agent Server contract                                     | pending                                                                           |
 
 When an SDK gap closes, its surface belongs on this page next to Fork and the
-memory loop.
+Notes loop.
 
-## Memory tiers
+## Notes tiers
 
-| Tier                    | Conversation file                                 | Durable file                                          |
-| ----------------------- | ------------------------------------------------- | ----------------------------------------------------- |
-| global (user)           | `<runtime>/persistence/memory/MEMORY.md`          | `<persistence>/memory/MEMORY.md`                      |
-| project / agent profile | `<runtime>/workspace/.openhands/memory/MEMORY.md` | `<persistence>/memory/agents/<profile-key>/MEMORY.md` |
+| Tier                    | Conversation file                                        | Durable file                                                |
+| ----------------------- | -------------------------------------------------------- | ----------------------------------------------------------- |
+| global (user)           | `<runtime>/persistence/notes/NOTES.md`                   | `<persistence>/notes/NOTES.md`                              |
+| project / agent profile | `<runtime>/workspace/.openhands/notes/NOTES.md`          | `<persistence>/notes/agents/<profile-key>/NOTES.md`         |
+
+The conversation files are named `NOTES.md`, not `MEMORY.md`, and live under
+`notes/`, not `memory/` — on purpose. OpenHands' own `load_memory` reads
+`memory/MEMORY.md`, so keeping Notes elsewhere means the SDK's memory loader
+never picks them up; the host injects them explicitly instead (see below).
+Those conversation files are **not** pre-created: a conversation that has
+written no Notes has no file, and the store reaches it only through the
+injection below.
 
 `<profile-key>` is the profile the conversation ran with: the launched
 `launched_agent_profile.agent_profile_id` (from
@@ -74,45 +85,57 @@ memory loop.
 otherwise the seeded `default` agent profile. A local OpenHands launch on
 `default` goes through global `agent_settings` instead of a profile launch, so
 Canvas records nothing for it — absence means `default`, not an unknown profile.
-The currently active profile never decides where a conversation's memory goes.
+The currently active profile never decides where a conversation's Notes go.
 
 Profile ids are shown by name, read from `agent-profiles/*.json`, so the rows
 and the durable store agree in human terms; an id with no profile file left
 falls back to its short id, and a root with no default profile at all falls back
 to the literal `default` key.
 
-## Memory: seed and capture
+## Notes: inject and capture
 
-Memory moves in two directions, both as a **line union**, and neither needs a
-button.
+Notes move in two directions, neither of which needs a button.
 
-**Seed** runs before a conversation's container starts. The app unions the
-durable store into the conversation's runtime `MEMORY.md` files — the files the
-SDK's `load_memory` reads — keyed by the agent profile the conversation launches
-on. It covers all three creation seams: a conversation you start, a spawned
-worker, and a handover successor.
+**Inject** is the read path the agent actually sees. Before a conversation
+starts, the host reads the global and profile tiers, frames them, and sends the
+combined text as the create request's
+`agent_launch_additions.system_message_suffix_append` — deployment-controlled
+text the SDK appends to the agent's system message. That path renders raw and
+uncapped up to 32 KiB and needs no container file, so the agent receives Notes
+without going through OpenHands' memory loader. Over the 32 KiB budget the host
+drops the **oldest** lines first (Notes are appended, so the tail is the newest)
+and emits a truncation notice; the page warns as the store approaches the
+budget. A create with nothing to inject sends no suffix at all. It covers all
+three creation seams: a conversation you start, a spawned worker, and a handover
+successor, keyed by the agent profile each launches on.
 
 **Capture** runs as the conversation works. The backend's background watcher
-polls every conversation's `MEMORY.md` files and, when one changes, unions it
-into the durable store. Change detection is a `(mtime, size)` fingerprint per
+polls every conversation's `NOTES.md` files and, when one changes, unions it
+into the durable store. The agent creates its own copy on demand — the `notes`
+skill it starts with says where and how — so a conversation that has written
+nothing simply has no file. Change detection is a `(mtime, size)` fingerprint per
 file, so a file is read only when it moved; the durable global tier is written
 by the global file's changes and each project tier by its profile's file.
 
-The union itself is the same in both directions: the destination keeps its
-existing order, every incoming line it does not already have is appended,
-comparison ignores surrounding whitespace, blank lines are never appended, and
-the source's own copy is never rewritten. It is therefore idempotent — unioning
-twice adds nothing the second time. Writes are serialized by a lock, so the
-watcher and a manual `/api/promote` (kept for debugging) cannot interleave.
+The union keeps the destination's existing order, appends every incoming line it
+does not already have, ignores surrounding whitespace when comparing, never
+appends blank lines, and never rewrites the source's own copy. It is therefore
+idempotent — unioning twice adds nothing the second time. Writes are serialized
+by a lock, so the watcher and a manual `/api/capture` (kept for debugging) cannot
+interleave.
 
-Only `MEMORY.md` is seeded and captured; the SDK's daily logs (`YYYY-MM-DD.md`)
-are deliberately left alone. Capture is automatic, so idle eviction and deletion
-do not trigger a special pass: a conversation's memory has already been folded
-into the store by the time it stops changing.
+Only `NOTES.md` is injected and captured; OpenHands' own `memory/MEMORY.md` and
+daily logs are deliberately left alone. Capture is automatic, so idle eviction
+and deletion do not trigger a special pass: a conversation's Notes have already
+been folded into the store by the time it stops changing.
 
-`load_memory` is a host-wide Canvas setting the SDK reads; the app does not
-change it (seeding is inert without it) but surfaces its current value on the
-page so an empty memory block is never a mystery.
+A one-time migration adopts a pre-rename `memory/MEMORY.md` store as
+`notes/NOTES.md` at backend startup, so an older store is not orphaned.
+
+The page surfaces the store's line and character counts against the 32 KiB
+budget, and lets a human edit or delete a line. Because capture is an
+append-only union, a curated change is applied to the conversation copies that
+carry the same line too, so the next capture does not put it back.
 
 ## Fork
 
@@ -129,8 +152,8 @@ chosen **name** travels as `llm_profile_ref` on the fork request, so no profile
 credential ever reaches this page. Leaving the picker alone forks on the
 source's own LLM profile. Forking onto another profile replaces the fork's model
 — and the condenser that mirrors the agent's model — but not the
-`launched_agent_profile` the fork inherits, so memory still goes to the tier
-that profile owns: the picker chooses a model, not a memory owner.
+`launched_agent_profile` the fork inherits, so Notes still go to the tier
+that profile owns: the picker chooses a model, not a Notes owner.
 
 The Agent Server does the copy (see its `docker_runtime/forking.py`): the
 persisted conversation directory already has the shape its container loads on
@@ -155,12 +178,12 @@ container scans `<runtime>/persistence/plugins/` and
 hook reaches a conversation — no image change and no Agent Server change.
 
 `POST /api/seed` reserves the id (the app chooses it), writes the plugin under
-`<runtime>/persistence/plugins/handover-hook/`, and unions the durable memory the
-launch profile owns into the conversation's two runtime `MEMORY.md` files,
-returning the id. The page then asks the host to `POST /api/conversations` with
-that id and body. Owning the id is what makes it deterministic: a conversation
-created with an `initial_message` starts running inside that same call, so
-seeding after it is too late.
+`<runtime>/persistence/plugins/handover-hook/`, and returns the id plus the
+framed `notes_prompt` the page must send as the create's
+`agent_launch_additions.system_message_suffix_append`. The page then asks the
+host to `POST /api/conversations` with that id and body. Owning the id is what
+makes it deterministic: a conversation created with an `initial_message` starts
+running inside that same call, so seeding after it is too late.
 (Canvas-started conversations pick their own id; covering those needs a
 filesystem watcher that seeds during container startup, which this app does not
 do yet.)
@@ -190,12 +213,14 @@ stored profile). For an ACP agent profile, which names its own backend instead o
 an LLM profile, the LLM dropdown is disabled.
 
 The seeded plugin carries both **content** and a **hook**: four AgentSkills
-(`skills/handover`, `skills/spawn`, `skills/done`, and `skills/memory`) and a
-hook (`hooks/hooks.json` dispatching to `bin/hook.sh`). The `memory` skill tells
+(`skills/handover`, `skills/spawn`, `skills/done`, and `skills/notes`) and a
+hook (`hooks/hooks.json` dispatching to `bin/hook.sh`). The `notes` skill tells
 the agent *how and when* to store durable facts: what belongs in each tier
-(user-global prefs and style in `persistence/memory/MEMORY.md`; project and
-how-to-run facts in `.openhands/memory/MEMORY.md`), to keep `MEMORY.md` a small
-high-value index, and to append rather than rewrite. The hook runs on
+(user-global prefs and style in `persistence/notes/NOTES.md`; project and
+how-to-run facts in `.openhands/notes/NOTES.md`), to create the file if it is
+missing, to keep Notes a small high-value reference card rather than a running
+log, to append rather than rewrite, and never to touch OpenHands'
+`.openhands/memory/MEMORY.md`. The hook runs on
 `session_start`, `user_prompt_submit` and `stop`: it appends to
 `.openhands/handover/hook.log`, records the conversation id once, and on `stop`
 counts runs and writes a *request* when a cheap threshold trips. It never calls
@@ -266,12 +291,12 @@ The three parts:
    skill is content, not mechanics.
 2. **The watcher.** The backend runs a background thread that polls
    `runtime-data/*/workspace/.openhands/spawn/` every couple of seconds (and, on
-   the same loop, captures conversation memory — see *Memory: seed and capture*).
-   When it finds a request it reserves an id, **seeds the plugin and the worker
-   profile's memory into the new runtime directory before the create** (so the
-   worker's first run already has the hook and all four skills), and creates a
-   **top-level** conversation through the Agent Server API, tagged `role=worker`
-   / `spawnedby=<parent hex>`.
+   the same loop, captures conversation Notes — see *Notes: inject and
+   capture*). When it finds a request it reserves an id, **seeds the plugin into
+   the new runtime directory before the create** (so the worker's first run
+   already has the hook and all four skills), passes the worker profile's Notes
+   as the create's launch suffix, and creates a **top-level** conversation
+   through the Agent Server API, tagged `role=worker` / `spawnedby=<parent hex>`.
 3. **The create is host-side.** The backend is a child of the Agent Server
    process, so it discovers the Agent Server's listen address and session key
    from that parent (`/proc/<ppid>/environ` and its `--host`/`--port` argv), with
@@ -341,8 +366,8 @@ its workers, each indented and carrying its run status (`goal running`,
 A worker whose parent no longer exists stays at the top level. The parent row
 keeps the `spawn requested` / `spawn error` chips, and the header's **Background
 spawns** line reports whether the watcher found Agent Server access and how many
-workers it has created and completed (`GET /api/spawner`). A companion **Memory
-capture** line reports how many memory files the watcher has folded into the
+workers it has created and completed (`GET /api/spawner`). A companion **Notes
+capture** line reports how many Notes files the watcher has folded into the
 durable store and when it last ran; capture is independent of spawn access, so
 it stays on even when no Agent Server credentials were discovered.
 
@@ -352,7 +377,7 @@ it stays on even when no Agent Server credentials were discovered.
 > dev stack; on a deployment it must be checked, and `spawner.json` is the
 > override when discovery cannot find the credentials. If the header says
 > background spawns are *off*, no credentials were discovered and no spawn will be
-> fulfilled — memory capture still runs, since it needs only the host filesystem.
+> fulfilled — Notes capture still runs, since it needs only the host filesystem.
 
 ## Names and tags
 
@@ -405,10 +430,12 @@ src/launcher.py          runnable entry point, staged to bin/ in the artifact
 src/isolated_chat_backend/  the host process: stdlib-only Python package
   persistence.py         the host store layout, conversation records, and the
                          runtime-directory removal the Delete action uses
-  profiles.py            agent profiles and the durable memory key they own
-  memory.py              the durable store and the seed/capture line union
+  profiles.py            agent profiles and the durable Notes key they own
+  notes.py               the durable Notes store: framing/injection, the
+                         capture line union, curation, and the one-time
+                         memory/ -> notes/ migration
   hooks.py               the seed plugin: manifest, hooks, the cheap gate
-                         script, and the handover + spawn + done + memory skills,
+                         script, and the handover + spawn + done + notes skills,
                          written into a new conversation's runtime dir before it
                          starts
   handover.py            host-side handover: read the cheap request, optional
@@ -417,20 +444,20 @@ src/isolated_chat_backend/  the host process: stdlib-only Python package
                          the parent process, turn a conversation's spawn request
                          into a top-level worker running as a goal, post the
                          worker's result back into the parent, and capture every
-                         conversation's memory into the durable store on the same
+                         conversation's Notes into the durable store on the same
                          poll
   state.py               the /api/state payload (handover + spawn state, the
-                         load_memory setting, and the flags that say whether
-                         Canvas lists a row) and the debug clear
+                         Notes budget, and the flags that say whether Canvas
+                         lists a row) and the debug clear
   server.py              HTTP routing (GET /health, /api/state, /api/spawner,
-                         /, assets; POST /api/seed, /api/handover, /api/promote
-                         [debug], /api/delete, /api/clear)
+                         /, assets; POST /api/seed, /api/handover, /api/capture
+                         [debug], /api/notes, /api/delete, /api/clear)
   __main__.py            argv parsing, store discovery, the watcher thread, serve
   web/                   the backend view served to the iframe:
                          index.html, app.css, app.js
 backend/linux-amd64.tar.gz  built artifact (bin/ + lib/); digest pinned in the manifest
 scripts/build-backend.sh builds the artifact and rewrites the pinned digest
-tests/test_isolated_chat_backend.py  unit tests for the union, path resolution, the hook seed, memory seed/capture, handover, and the spawner (goal, completion, parent notify)
+tests/test_isolated_chat_backend.py  unit tests for the union, path resolution, the hook seed, Notes injection/capture, handover, and the spawner (goal, completion, parent notify)
 docs/conversation-isolation-gaps.md  the original gap inventory (ISO-nn)
 ```
 
@@ -457,13 +484,13 @@ bridge (`canvas_app_backend_bridge_v1`, released in Agent Server 1.56.0) and
 | ------- | ---------------------------------------------------------------------------------------------------------------------------------- |
 | Start   | The Canvas App backend bridge, a Docker-runtime Agent Server, and a persisted `settings.json` with `agent_settings` to launch from. |
 | Spawn   | The managed backend running with Agent Server access (discovered from its parent process, or set in `spawner.json`). No page open at spawn time. Worker goals need `POST /{id}/goal`; without it the task falls back to a normal run. |
-| Memory  | Nothing server-side beyond the conversation files: **seed** writes them before the create and **capture** reads them off disk; both are host-file work. Seeding's **effect** — the agent actually loading the memory — needs the host-wide `load_memory` setting on. |
+| Notes   | Nothing server-side beyond the conversation files: **inject** rides the create's `agent_launch_additions.system_message_suffix_append` (host-composed text, no server feature), and **capture** reads the conversation files off disk. The agent creates its own notes file on demand. All host-file work; no host-wide setting gates it. |
 | Fork    | Agent Server with the host-side Docker fork route; a stock release answers `501`.                                                   |
 
 All of these are Agent Server contracts or app-host work, not image changes, so
 upstream releases will carry the contract half; until they do, point the Agent
-Server at a checkout that has them. Without them the page still works: memory
-only changes the conversation and host files, and each Fork row reports the
+Server at a checkout that has them. Without them the page still works: Notes
+only change the conversation and host files, and each Fork row reports the
 server's error.
 
 ## Install
@@ -516,16 +543,26 @@ must accept it once. The durable fix is a certificate the browser already trusts
 - The durable-store union is not a merge: a line an agent later **corrects** is
   appended as a new line, and the stale line stays. Only whole lines are ever
   added, never updated or removed, so the store is append-only by design.
+- Notes are injection-only: nothing is pre-copied into a conversation, so a
+  conversation that never writes a Notes file has none to capture, and the store
+  first reaches it through the launch suffix. The `notes` skill tells the agent
+  to create the file when it has something worth keeping.
 - Capture polls on the same couple-of-seconds loop as spawns, so a line written
   by the agent reaches the store shortly after the file changes, not instantly.
-  Only `MEMORY.md` is watched; the SDK's daily logs are not captured.
+  Only `NOTES.md` is watched; OpenHands' `memory/MEMORY.md` and the SDK's daily
+  logs are neither watched nor injected.
 - Capture is host-file work, so it runs even when no Agent Server credentials
-  were discovered (spawns would be off); only `load_memory` being off makes the
-  seeded memory inert to the agent.
+  were discovered (spawns would be off).
+- OpenHands' own persistent memory stays host-wide enabled (`settings.json` →
+  `load_memory: true`) and cannot be switched off per-request or per-profile, so
+  the agent's base prompt still advertises `.openhands/memory/MEMORY.md`. The
+  Notes preamble and `notes` skill tell the agent not to use it, and it is
+  per-conversation (a fresh workspace and HOME per launch), so anything written
+  there is inert and never captured.
 - Fork needs an Agent Server whose host-side fork route is live; an older server
   answers 501 and the row reports the failure.
 - Clearing the durable store is debug-only and will be removed: it exists to get
-  back to a conversation that starts with no memory, and it is not recoverable
+  back to a conversation that starts with no Notes, and it is not recoverable
   beyond what each conversation still carries.
 - A fork shares its source's workspace. Deleting the source leaves the fork
   pointing at a workspace that no longer exists; the Agent Server recreates it

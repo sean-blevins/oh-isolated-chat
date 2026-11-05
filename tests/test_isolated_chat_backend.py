@@ -14,7 +14,7 @@ sys.path.insert(0, str(SRC))
 from isolated_chat_backend import (  # noqa: E402
     handover,
     hooks,
-    memory,
+    notes,
     persistence,
     profiles,
     spawner,
@@ -26,12 +26,12 @@ def make_tree(tmp: Path) -> Path:
     """Create a persistence root with one conversation holding both tiers."""
     root = tmp / "persistence"
     runtime = root / "runtime-data" / "aa11bb22cc33dd44"
-    (runtime / "persistence" / "memory").mkdir(parents=True)
-    (runtime / "workspace" / ".openhands" / "memory").mkdir(parents=True)
-    (runtime / "persistence" / "memory" / "MEMORY.md").write_text(
+    (runtime / "persistence" / "notes").mkdir(parents=True)
+    (runtime / "workspace" / ".openhands" / "notes").mkdir(parents=True)
+    (runtime / "persistence" / "notes" / "NOTES.md").write_text(
         "- global: user prefers tabs\n- global: works on the OpenHands frontend\n"
     )
-    (runtime / "workspace" / ".openhands" / "memory" / "MEMORY.md").write_text(
+    (runtime / "workspace" / ".openhands" / "notes" / "NOTES.md").write_text(
         "- project: isolated conversations keep their own memory\n"
     )
     return root
@@ -53,20 +53,20 @@ def write_state(root: Path, hex_id: str) -> None:
 def test_union_appends_only_new_lines() -> None:
     existing = "- a\n- b\n"
     incoming = "- b\n- c\n\n- d\n"
-    merged, added = memory.union_text(existing, incoming)
+    merged, added = notes.union_text(existing, incoming)
     assert merged == "- a\n- b\n- c\n- d\n", merged
     assert added == ["- c", "- d"], added
 
 
 def test_union_is_idempotent_and_keeps_existing_order() -> None:
-    first, _ = memory.union_text("", "- a\n")
-    second, added = memory.union_text(first, "- a\n")
+    first, _ = notes.union_text("", "- a\n")
+    second, added = notes.union_text(first, "- a\n")
     assert second == first
     assert added == []
 
 
 def test_union_ignores_whitespace_only_differences() -> None:
-    merged, added = memory.union_text("- keep\n", "   - keep   \n")
+    merged, added = notes.union_text("- keep\n", "   - keep   \n")
     assert merged == "- keep\n"
     assert added == []
 
@@ -79,7 +79,7 @@ def test_find_persistence_root_walks_up_from_backend_data_dir() -> None:
         assert persistence.find_persistence_root(data_dir) == root
 
 
-def test_promote_writes_both_tiers_and_is_repeatable() -> None:
+def test_capture_conversation_writes_both_tiers_and_is_repeatable() -> None:
     with tempfile.TemporaryDirectory() as tmp:
         root = make_tree(Path(tmp))
         hex_id = "aa11bb22cc33dd44"
@@ -88,11 +88,11 @@ def test_promote_writes_both_tiers_and_is_repeatable() -> None:
             json.dumps({"launched_agent_profile": {"agent_profile_id": "profile-1"}})
         )
 
-        first = memory.promote(root, hex_id)
+        first = notes.capture_conversation(root, hex_id)
         assert first["profile_key"] == "profile-1"
         assert first["profile_key_source"] == "launched"
-        global_store = root / "memory" / "MEMORY.md"
-        profile_store = root / "memory" / "agents" / "profile-1" / "MEMORY.md"
+        global_store = root / "notes" / "NOTES.md"
+        profile_store = root / "notes" / "agents" / "profile-1" / "NOTES.md"
         assert "user prefers tabs" in global_store.read_text()
         assert "isolated conversations" in profile_store.read_text()
         assert len(first["tiers"]["global"]["added"]) == 2
@@ -100,20 +100,20 @@ def test_promote_writes_both_tiers_and_is_repeatable() -> None:
 
         # A second promotion adds nothing and must not rewrite the store.
         before = global_store.read_text()
-        second = memory.promote(root, hex_id)
+        second = notes.capture_conversation(root, hex_id)
         assert second["tiers"]["global"]["added"] == []
         assert global_store.read_text() == before
 
 
-def test_promote_appends_to_existing_durable_lines_in_order() -> None:
+def test_capture_conversation_appends_to_existing_durable_lines_in_order() -> None:
     with tempfile.TemporaryDirectory() as tmp:
         root = make_tree(Path(tmp))
         hex_id = "aa11bb22cc33dd44"
-        store = root / "memory" / "MEMORY.md"
+        store = root / "notes" / "NOTES.md"
         store.parent.mkdir(parents=True)
         store.write_text("- durable: already here\n")
 
-        memory.promote(root, hex_id)
+        notes.capture_conversation(root, hex_id)
         assert store.read_text() == (
             "- durable: already here\n"
             "- global: user prefers tabs\n"
@@ -139,7 +139,7 @@ def test_profile_key_uses_the_default_profile_when_none_was_launched() -> None:
     with tempfile.TemporaryDirectory() as tmp:
         root = make_tree(Path(tmp))
         hex_id = "aa11bb22cc33dd44"
-        # No profile files at all: nothing to point the memory at.
+        # No profile files at all: nothing to point the notes at.
         assert profiles.profile_key(root, hex_id) == ("default", "unresolved")
 
         (root / "agent-profiles").mkdir()
@@ -150,7 +150,7 @@ def test_profile_key_uses_the_default_profile_when_none_was_launched() -> None:
             json.dumps({"id": "profile-2", "name": "project_specific_agent"})
         )
         # A conversation with no record ran on the default profile, so the active
-        # profile does not take ownership of its memory.
+        # profile does not take ownership of its notes.
         (root / "settings.json").write_text(
             json.dumps({"active_agent_profile_id": "profile-2"})
         )
@@ -192,16 +192,16 @@ def test_state_labels_profiles_by_name_and_flags_assumptions() -> None:
         )
         assert defaulted["profile_key_source"] == "default"
 
-        (root / "memory" / "agents" / "profile-1").mkdir(parents=True)
-        (root / "memory" / "agents" / "profile-1" / "MEMORY.md").write_text("- x\n")
+        (root / "notes" / "agents" / "profile-1").mkdir(parents=True)
+        (root / "notes" / "agents" / "profile-1" / "NOTES.md").write_text("- x\n")
         durable = {file["key"]: file["name"] for file in state.durable_state(root)}
         assert durable["profile-1"] == "default"
 
 
-def test_missing_conversation_memory_is_not_an_error() -> None:
+def test_missing_conversation_notes_is_not_an_error() -> None:
     with tempfile.TemporaryDirectory() as tmp:
         root = make_tree(Path(tmp))
-        result = memory.promote(root, "ffffffffffffffff")
+        result = notes.capture_conversation(root, "ffffffffffffffff")
         assert result["tiers"]["global"]["present"] is False
         assert result["tiers"]["global"]["added"] == []
 
@@ -209,43 +209,17 @@ def test_missing_conversation_memory_is_not_an_error() -> None:
 def test_key_for_profile_prefers_the_requested_profile_then_default() -> None:
     with tempfile.TemporaryDirectory() as tmp:
         root = make_tree(Path(tmp))
-        assert memory.key_for_profile(root, "p1") == "p1"
+        assert notes.key_for_profile(root, "p1") == "p1"
         # No profile recorded (a pre-create seed) falls back to the default.
-        assert memory.key_for_profile(root, None) == "default"
+        assert notes.key_for_profile(root, None) == "default"
         (root / "agent-profiles").mkdir()
         (root / "agent-profiles" / "default.json").write_text(
             json.dumps({"id": "d1", "name": "default"})
         )
-        assert memory.key_for_profile(root, None) == "d1"
+        assert notes.key_for_profile(root, None) == "d1"
 
 
-def test_seed_conversation_unions_the_durable_store_into_both_tiers() -> None:
-    with tempfile.TemporaryDirectory() as tmp:
-        root = make_tree(Path(tmp))
-        (root / "memory").mkdir()
-        (root / "memory" / "MEMORY.md").write_text("- durable global\n")
-        (root / "memory" / "agents" / "profile-1").mkdir(parents=True)
-        (root / "memory" / "agents" / "profile-1" / "MEMORY.md").write_text(
-            "- durable project\n"
-        )
-        hex_id = "cc11dd22ee33ff44"
-        result = memory.seed_conversation(root, hex_id, "profile-1")
-        assert result["tiers"]["global"]["seeded"] is True
-        assert result["tiers"]["profile"]["seeded"] is True
-        runtime = root / "runtime-data" / hex_id
-        assert (runtime / "persistence" / "memory" / "MEMORY.md").read_text() == (
-            "- durable global\n"
-        )
-        assert (runtime / "workspace" / ".openhands" / "memory" / "MEMORY.md").read_text() == (
-            "- durable project\n"
-        )
-        # A re-seed is a union, so it adds nothing the second time.
-        again = memory.seed_conversation(root, hex_id, "profile-1")
-        assert again["tiers"]["global"]["seeded"] is False
-        assert again["tiers"]["profile"]["seeded"] is False
-
-
-def test_capture_unions_only_changed_conversation_memory() -> None:
+def test_capture_unions_only_changed_conversation_notes() -> None:
     with tempfile.TemporaryDirectory() as tmp:
         root = make_tree(Path(tmp))
         hex_id = "aa11bb22cc33dd44"
@@ -253,22 +227,22 @@ def test_capture_unions_only_changed_conversation_memory() -> None:
             root, hex_id, launched_agent_profile={"agent_profile_id": "profile-1"}
         )
         seen: dict = {}
-        assert memory.capture(root, seen) == [hex_id]
-        assert "user prefers tabs" in (root / "memory" / "MEMORY.md").read_text()
+        assert notes.capture(root, seen) == [hex_id]
+        assert "user prefers tabs" in (root / "notes" / "NOTES.md").read_text()
         # Nothing changed: no re-read, no write.
-        assert memory.capture(root, seen) == []
+        assert notes.capture(root, seen) == []
         # A new line is captured on the next change.
-        source = root / "runtime-data" / hex_id / "persistence" / "memory" / "MEMORY.md"
+        source = root / "runtime-data" / hex_id / "persistence" / "notes" / "NOTES.md"
         source.write_text(source.read_text() + "- global: a new fact\n")
-        assert memory.capture(root, seen) == [hex_id]
-        assert "a new fact" in (root / "memory" / "MEMORY.md").read_text()
+        assert notes.capture(root, seen) == [hex_id]
+        assert "a new fact" in (root / "notes" / "NOTES.md").read_text()
 
 
 def test_capture_skips_conversations_without_a_canvas_record() -> None:
     """A record-less runtime dir must not leak into the default profile tier.
 
     Canvas writes ``meta.json`` slightly after a conversation starts, while the
-    watcher polls every couple of seconds, so a seeded conversation's memory can
+    watcher polls every couple of seconds, so a seeded conversation's notes can
     change before its launched profile is on disk. Capturing it then would fall
     back to the default profile and cross-contaminate the default durable store.
     """
@@ -280,47 +254,47 @@ def test_capture_skips_conversations_without_a_canvas_record() -> None:
         )
         hex_id = "aa11bb22cc33dd44"
         project = (
-            root / "runtime-data" / hex_id / "workspace" / ".openhands" / "memory"
+            root / "runtime-data" / hex_id / "workspace" / ".openhands" / "notes"
         )
         project.mkdir(parents=True)
-        (project / "MEMORY.md").write_text(
+        (project / "NOTES.md").write_text(
             "- project: only the test profile owns this\n"
         )
 
         seen: dict = {}
         # No Canvas record yet: nothing is captured, so the default tier stays clean.
-        assert memory.capture(root, seen) == []
-        assert not (root / "memory" / "agents" / "default-1" / "MEMORY.md").exists()
+        assert notes.capture(root, seen) == []
+        assert not (root / "notes" / "agents" / "default-1" / "NOTES.md").exists()
 
         # Once Canvas records the launched profile, the same unchanged file is
         # captured under that profile -- proving the skip was not a lost cache.
         write_record(
             root, hex_id, launched_agent_profile={"agent_profile_id": "profile-x"}
         )
-        assert memory.capture(root, seen) == [hex_id]
+        assert notes.capture(root, seen) == [hex_id]
         assert "only the test profile owns this" in (
-            root / "memory" / "agents" / "profile-x" / "MEMORY.md"
+            root / "notes" / "agents" / "profile-x" / "NOTES.md"
         ).read_text()
-        assert not (root / "memory" / "agents" / "default-1" / "MEMORY.md").exists()
+        assert not (root / "notes" / "agents" / "default-1" / "NOTES.md").exists()
 
 
 def test_durable_tier_for_path_accepts_only_the_store() -> None:
     with tempfile.TemporaryDirectory() as tmp:
         root = make_tree(Path(tmp))
-        assert memory.durable_tier_for_path(root, root / "memory" / "MEMORY.md") == (
+        assert notes.durable_tier_for_path(root, root / "notes" / "NOTES.md") == (
             "global",
             "",
         )
-        assert memory.durable_tier_for_path(
-            root, root / "memory" / "agents" / "p1" / "MEMORY.md"
+        assert notes.durable_tier_for_path(
+            root, root / "notes" / "agents" / "p1" / "NOTES.md"
         ) == ("profile", "p1")
         assert (
-            memory.durable_tier_for_path(
-                root, root / "runtime-data" / "aa11bb22cc33dd44" / "MEMORY.md"
+            notes.durable_tier_for_path(
+                root, root / "runtime-data" / "aa11bb22cc33dd44" / "NOTES.md"
             )
             is None
         )
-        assert memory.durable_tier_for_path(root, root / "settings.json") is None
+        assert notes.durable_tier_for_path(root, root / "settings.json") is None
 
 
 def test_edit_durable_line_rewrites_the_store_and_the_conversation_copy() -> None:
@@ -330,12 +304,12 @@ def test_edit_durable_line_rewrites_the_store_and_the_conversation_copy() -> Non
         write_record(
             root, hex_id, launched_agent_profile={"agent_profile_id": "profile-1"}
         )
-        memory.promote(root, hex_id)
-        durable = root / "memory" / "agents" / "profile-1" / "MEMORY.md"
+        notes.capture_conversation(root, hex_id)
+        durable = root / "notes" / "agents" / "profile-1" / "NOTES.md"
         old = "- project: isolated conversations keep their own memory"
         new = "- project: isolated conversations keep their own memory (per profile)"
 
-        result = memory.edit_durable_line(root, durable, old, new)
+        result = notes.edit_durable_line(root, durable, old, new)
         assert result["ok"] is True
         assert result["changed"] is True
         durable_lines = durable.read_text().splitlines()
@@ -349,23 +323,23 @@ def test_edit_durable_line_rewrites_the_store_and_the_conversation_copy() -> Non
             / hex_id
             / "workspace"
             / ".openhands"
-            / "memory"
-            / "MEMORY.md"
+            / "notes"
+            / "NOTES.md"
         )
         copy_lines = copy.read_text().splitlines()
         assert new in copy_lines
         assert old not in copy_lines
-        assert memory.capture(root, {}) == []
+        assert notes.capture(root, {}) == []
 
         # Editing a line to itself is a no-op.
-        assert memory.edit_durable_line(root, durable, new, new)["changed"] is False
+        assert notes.edit_durable_line(root, durable, new, new)["changed"] is False
 
 
 def test_delete_durable_line_is_scoped_to_the_tier_and_profile() -> None:
     with tempfile.TemporaryDirectory() as tmp:
         root = Path(tmp) / "persistence"
-        project = Path("workspace") / ".openhands" / "memory" / "MEMORY.md"
-        global_rel = Path("persistence") / "memory" / "MEMORY.md"
+        project = Path("workspace") / ".openhands" / "notes" / "NOTES.md"
+        global_rel = Path("persistence") / "notes" / "NOTES.md"
 
         def put(path: Path, text: str) -> None:
             path.parent.mkdir(parents=True, exist_ok=True)
@@ -380,16 +354,16 @@ def test_delete_durable_line_is_scoped_to_the_tier_and_profile() -> None:
             )
             put(root / "runtime-data" / hex_id / project, "- shared project line\n")
             put(root / "runtime-data" / hex_id / global_rel, "- shared global line\n")
-        put(root / "memory" / "agents" / "p1" / "MEMORY.md", "- shared project line\n")
-        put(root / "memory" / "agents" / "p2" / "MEMORY.md", "- shared project line\n")
-        put(root / "memory" / "MEMORY.md", "- shared global line\n")
+        put(root / "notes" / "agents" / "p1" / "NOTES.md", "- shared project line\n")
+        put(root / "notes" / "agents" / "p2" / "NOTES.md", "- shared project line\n")
+        put(root / "notes" / "NOTES.md", "- shared global line\n")
 
         # Deleting from p1's tier reaches p1's own conversation copy only.
-        p1 = root / "memory" / "agents" / "p1" / "MEMORY.md"
-        result = memory.delete_durable_line(root, p1, "- shared project line")
+        p1 = root / "notes" / "agents" / "p1" / "NOTES.md"
+        result = notes.delete_durable_line(root, p1, "- shared project line")
         assert result["ok"] is True and result["changed"] is True
         assert p1.read_text().strip() == ""
-        assert (root / "memory" / "agents" / "p2" / "MEMORY.md").read_text().strip() == (
+        assert (root / "notes" / "agents" / "p2" / "NOTES.md").read_text().strip() == (
             "- shared project line"
         )
         assert (
@@ -400,8 +374,8 @@ def test_delete_durable_line_is_scoped_to_the_tier_and_profile() -> None:
         ).read_text().strip() == "- shared project line"
 
         # A global line reaches every conversation, whatever the profile.
-        memory.delete_durable_line(
-            root, root / "memory" / "MEMORY.md", "- shared global line"
+        notes.delete_durable_line(
+            root, root / "notes" / "NOTES.md", "- shared global line"
         )
         assert (
             root / "runtime-data" / "aa11bb22cc33dd44" / global_rel
@@ -414,8 +388,8 @@ def test_delete_durable_line_is_scoped_to_the_tier_and_profile() -> None:
 def test_durable_state_reports_line_and_char_counts() -> None:
     with tempfile.TemporaryDirectory() as tmp:
         root = make_tree(Path(tmp))
-        (root / "memory").mkdir()
-        (root / "memory" / "MEMORY.md").write_text("- a\n- b\n")
+        (root / "notes").mkdir()
+        (root / "notes" / "NOTES.md").write_text("- a\n- b\n")
         files = state.durable_state(root)
         global_file = next(file for file in files if file["key"] == "global")
         assert global_file["lines"] == 2
@@ -508,8 +482,8 @@ def test_remove_runtime_dir_deletes_only_the_runtime_directory() -> None:
         root = make_tree(Path(tmp))
         hex_id = "aa11bb22cc33dd44"
         write_record(root, hex_id, title="keep the record")
-        (root / "memory").mkdir()
-        (root / "memory" / "MEMORY.md").write_text("- durable line\n")
+        (root / "notes").mkdir()
+        (root / "notes" / "NOTES.md").write_text("- durable line\n")
 
         assert persistence.remove_runtime_dir(root, hex_id) is True
         assert not (root / "runtime-data" / hex_id).exists()
@@ -518,7 +492,7 @@ def test_remove_runtime_dir_deletes_only_the_runtime_directory() -> None:
         assert (
             root / "agent-canvas" / "dev_conversations" / hex_id / "meta.json"
         ).is_file()
-        assert (root / "memory" / "MEMORY.md").read_text() == "- durable line\n"
+        assert (root / "notes" / "NOTES.md").read_text() == "- durable line\n"
         # Deleting something already gone is not an error.
         assert persistence.remove_runtime_dir(root, hex_id) is False
 
@@ -530,7 +504,7 @@ def test_clear_durable_removes_both_tiers_and_their_profile_dirs() -> None:
         write_record(
             root, hex_id, launched_agent_profile={"agent_profile_id": "profile-1"}
         )
-        memory.promote(root, hex_id)
+        notes.capture_conversation(root, hex_id)
         assert len(state.durable_state(root)) == 2
 
         removed = state.clear_durable(root)
@@ -538,7 +512,7 @@ def test_clear_durable_removes_both_tiers_and_their_profile_dirs() -> None:
         assert len(removed) == 2
         assert state.durable_state(root) == []
         # The profile's directory existed only to hold the file just removed.
-        assert not (root / "memory" / "agents" / "profile-1").exists()
+        assert not (root / "notes" / "agents" / "profile-1").exists()
 
 
 def test_clear_durable_leaves_the_conversation_able_to_promote_again() -> None:
@@ -548,10 +522,10 @@ def test_clear_durable_leaves_the_conversation_able_to_promote_again() -> None:
         write_record(
             root, hex_id, launched_agent_profile={"agent_profile_id": "profile-1"}
         )
-        memory.promote(root, hex_id)
+        notes.capture_conversation(root, hex_id)
         state.clear_durable(root)
 
-        restored = memory.promote(root, hex_id)
+        restored = notes.capture_conversation(root, hex_id)
 
         assert restored["tiers"]["global"]["added"] == [
             "- global: user prefers tabs",
@@ -605,21 +579,24 @@ def test_seed_contributes_the_handover_skill() -> None:
         assert "conversation.json" in text  # the link back to the chain
 
 
-def test_seed_contributes_the_memory_skill() -> None:
+def test_seed_contributes_the_notes_skill() -> None:
     with tempfile.TemporaryDirectory() as tmp:
         root = make_tree(Path(tmp))
         plugin = hooks.seed(root, "cc11dd22ee33ff44")
-        skill = plugin / hooks.MEMORY_SKILL_REL
+        skill = plugin / hooks.NOTES_SKILL_REL
         assert skill.is_file()
         text = skill.read_text()
         assert text.startswith("---")
-        assert "name: memory" in text
-        # It names both tiers, frames memory as a small curated reference card,
-        # and routes evolving state to the handover artifact instead.
-        assert ".openhands/memory/MEMORY.md" in text
+        assert "name: notes" in text
+        # It names both tiers, frames notes as a small curated reference card,
+        # routes evolving state to the handover artifact, and steers clear of
+        # OpenHands' own memory file.
+        assert "$HOME/notes/NOTES.md" in text
+        assert ".openhands/notes/NOTES.md" in text
         assert "reference card" in text
         assert "handover.md" in text
         assert "append-only union" in text
+        assert ".openhands/memory/MEMORY.md" in text  # warned against
 
 
 def test_seed_writes_an_executable_hook_script() -> None:
@@ -662,29 +639,60 @@ def test_read_agent_settings_returns_the_stored_source_or_none() -> None:
         assert persistence.read_agent_settings(root) is None
 
 
-def test_read_load_memory_reads_the_host_setting_or_none() -> None:
+def test_notes_prompt_frames_both_tiers_or_is_none() -> None:
     with tempfile.TemporaryDirectory() as tmp:
-        root = make_tree(Path(tmp))
-        assert persistence.read_load_memory(root) is None
-        (root / "settings.json").write_text(
-            json.dumps({"agent_settings": {"agent_context": {"load_memory": True}}})
-        )
-        assert persistence.read_load_memory(root) is True
-        # A non-boolean (or a settings file without the field) is "unknown".
-        (root / "settings.json").write_text(
-            json.dumps({"agent_settings": {"agent_context": {"load_memory": "yes"}}})
-        )
-        assert persistence.read_load_memory(root) is None
+        root = Path(tmp) / "persistence"
+        assert notes.notes_prompt(root, "p1") is None
+        (root / "notes").mkdir(parents=True)
+        (root / "notes" / "NOTES.md").write_text("- global fact\n")
+        (root / "notes" / "agents" / "p1").mkdir(parents=True)
+        (root / "notes" / "agents" / "p1" / "NOTES.md").write_text("- project fact\n")
+        text = notes.notes_prompt(root, "p1")
+        assert text is not None
+        assert "- global fact" in text and "- project fact" in text
+        assert "Global notes" in text
+        assert "Project notes" in text
 
 
-def test_state_reports_the_load_memory_setting() -> None:
+def test_notes_prompt_drops_the_oldest_lines_over_budget() -> None:
+    with tempfile.TemporaryDirectory() as tmp:
+        root = Path(tmp) / "persistence"
+        global_store = root / "notes" / "NOTES.md"
+        global_store.parent.mkdir(parents=True)
+        lines = [f"- fact number {i:03d} with some padding text" for i in range(80)]
+        global_store.write_text("\n".join(lines) + "\n")
+        budget = 900
+        result = notes.notes_prompt(root, "profile-1", char_budget=budget)
+        assert result is not None
+        assert len(result) <= budget
+        assert "[earlier notes truncated]" in result
+        assert lines[-1] in result  # the newest tail survives
+        assert lines[0] not in result  # the oldest line is dropped first
+
+
+def test_migrate_legacy_store_adopts_the_memory_files() -> None:
+    with tempfile.TemporaryDirectory() as tmp:
+        root = Path(tmp) / "persistence"
+        (root / "memory" / "agents" / "p1").mkdir(parents=True)
+        (root / "memory" / "MEMORY.md").write_text("- legacy global\n")
+        (root / "memory" / "agents" / "p1" / "MEMORY.md").write_text(
+            "- legacy project\n"
+        )
+        moved = notes.migrate_legacy_store(root)
+        assert len(moved) == 2
+        assert (root / "notes" / "NOTES.md").read_text() == "- legacy global\n"
+        assert (root / "notes" / "agents" / "p1" / "NOTES.md").read_text() == (
+            "- legacy project\n"
+        )
+        # The emptied legacy tree is removed, and a second pass is a no-op.
+        assert not (root / "memory").exists()
+        assert notes.migrate_legacy_store(root) == []
+
+
+def test_state_reports_the_notes_budget() -> None:
     with tempfile.TemporaryDirectory() as tmp:
         root = make_tree(Path(tmp))
-        assert state.state(root)["load_memory"] is None
-        (root / "settings.json").write_text(
-            json.dumps({"agent_settings": {"agent_context": {"load_memory": False}}})
-        )
-        assert state.state(root)["load_memory"] is False
+        assert state.state(root)["notes_char_budget"] == notes.NOTES_CHAR_BUDGET
 
 
 def _write_handover(root: Path, hex_id: str, **fields: object) -> Path:
@@ -786,24 +794,27 @@ def test_prepare_seeds_the_successor_writes_the_artifact_and_links_the_chain() -
         assert status["doc"] is True
 
 
-def test_prepare_seeds_the_successors_memory_from_the_launch_profile() -> None:
+def test_prepare_does_not_seed_notes_files() -> None:
     with tempfile.TemporaryDirectory() as tmp:
         root = make_tree(Path(tmp))
         hex_id = "aa11bb22cc33dd44"
-        (root / "memory" / "agents" / "next-profile").mkdir(parents=True)
-        (root / "memory" / "agents" / "next-profile" / "MEMORY.md").write_text(
+        (root / "notes" / "agents" / "next-profile").mkdir(parents=True)
+        (root / "notes" / "agents" / "next-profile" / "NOTES.md").write_text(
             "- project: continue from the handover\n"
         )
         successor = "99998888-7777-6666-5555-444433332222"
 
-        handover.prepare(root, hex_id, successor, agent_profile_id="next-profile")
+        handover.prepare(root, hex_id, successor)
 
         successor_hex = successor.replace("-", "")
-        project = (
-            root / "runtime-data" / successor_hex / "workspace"
-            / ".openhands" / "memory" / "MEMORY.md"
-        )
-        assert project.read_text() == "- project: continue from the handover\n"
+        # The durable store travels only as the launch-suffix injection; it is
+        # never copied into the successor's runtime dir. The agent creates its
+        # own notes file on demand, so none is pre-made here.
+        runtime = root / "runtime-data" / successor_hex
+        assert not (runtime / "persistence" / "notes" / "NOTES.md").exists()
+        assert not (
+            runtime / "workspace" / ".openhands" / "notes" / "NOTES.md"
+        ).exists()
 
 
 def test_prepare_clears_the_force_marker_so_it_does_not_refire() -> None:
@@ -886,7 +897,7 @@ def test_parse_verdict_ignores_prose_and_needs_a_bool() -> None:
 
 
 class FakeAgentServer:
-    """The bits of the Agent Server client the spawner uses, recorded in memory."""
+    """The bits of the Agent Server client the spawner uses, recorded in notes."""
 
     def __init__(
         self,
@@ -1191,31 +1202,39 @@ def test_spawn_worker_survives_a_secret_listing_failure() -> None:
         assert client.payloads
 
 
-def test_spawn_worker_seeds_memory_from_the_resolved_profile() -> None:
+def test_spawn_worker_injects_notes_from_the_resolved_profile() -> None:
     with tempfile.TemporaryDirectory() as tmp:
         root = make_tree(Path(tmp))
         parent = "aa11bb22cc33dd44"
         write_record(
             root, parent, launched_agent_profile={"agent_profile_id": "parent-profile"}
         )
-        # The durable tier that profile owns is seeded into the worker before the
-        # create, so its first run already carries the memory.
-        (root / "memory" / "agents" / "parent-profile").mkdir(parents=True)
-        (root / "memory" / "agents" / "parent-profile" / "MEMORY.md").write_text(
+        (root / "notes" / "agents" / "parent-profile").mkdir(parents=True)
+        (root / "notes" / "agents" / "parent-profile" / "NOTES.md").write_text(
             "- project: run it with make\n"
         )
         config = spawner.SpawnerConfig(agent_server_url="http://x", session_key="k")
+        client = FakeAgentServer()
         spawner.spawn_worker(
             root,
             parent,
             spawner.SpawnRequest(task="do it"),
             config,
-            FakeAgentServer(),
+            client,
             reserve=lambda: "11111111-2222-3333-4444-555555555555",
         )
+        # The worker receives the notes in its prompt, as a launch suffix --
+        # the same path the app's own page start uses.
+        suffix = client.payloads[0]["agent_launch_additions"][
+            "system_message_suffix_append"
+        ]
+        assert "- project: run it with make" in suffix
+        # Nothing is pre-copied into the worker's runtime dir: the durable store
+        # is injection only, and the agent creates its own notes file on demand.
         worker = root / "runtime-data" / "11111111222233334444555555555555"
-        seeded = worker / "workspace" / ".openhands" / "memory" / "MEMORY.md"
-        assert seeded.read_text() == "- project: run it with make\n"
+        assert not (
+            worker / "workspace" / ".openhands" / "notes" / "NOTES.md"
+        ).exists()
 
 
 def test_spawn_worker_can_opt_out_of_goal() -> None:
@@ -1360,7 +1379,7 @@ def test_watcher_scan_creates_a_worker_then_is_idempotent() -> None:
         assert len(client.payloads) == 1
 
 
-def test_watcher_captures_memory_without_a_spawner_config() -> None:
+def test_watcher_captures_notes_without_a_spawner_config() -> None:
     with tempfile.TemporaryDirectory() as tmp:
         root = make_tree(Path(tmp))
         hex_id = "aa11bb22cc33dd44"
@@ -1372,8 +1391,8 @@ def test_watcher_captures_memory_without_a_spawner_config() -> None:
         watcher = spawner.Watcher(root)
         assert watcher.client is None
         assert watcher.scan_once() == []
-        assert watcher.capture_memory() == [hex_id]
-        assert watcher.capture_memory() == []
+        assert watcher.capture_notes() == [hex_id]
+        assert watcher.capture_notes() == []
         status = watcher.status()
         assert status["enabled"] is False
         assert status["captured"] == 1

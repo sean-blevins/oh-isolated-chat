@@ -11,19 +11,19 @@
 <p class="lede">
   An isolated conversation runs in its own container: Canvas cannot fork it, and new conversations
   start from an empty runtime directory. This page is the host side of that gap. A new conversation
-  is <strong>seeded</strong> from the durable store — the plugin carrying the handover, spawn, done
-  and memory skills, plus the memory lines keyed to the agent profile it launches on. As a
-  conversation runs, its memory is <strong>captured automatically</strong> back into that store, as
-  a line union: it only adds lines the store does not already have, and never rewrites the
-  conversation's copy. There is no button to press. <strong>Fork</strong> copies a conversation's
-  full history and state into a new conversation, on the source's own LLM profile or on another one
-  you pick per row. <strong>Hand over</strong> starts a fresh conversation seeded with the
+  gets a <strong>seeded</strong> plugin carrying the handover, spawn, done and notes skills, and the
+  durable Notes keyed to the agent profile it launches on are injected into the prompt as a launch
+  suffix. As a conversation runs, its notes are <strong>captured
+  automatically</strong> back into that store, as a line union: it only adds lines the store does not
+  already have, and never rewrites the conversation's copy. There is no button to press. This store
+  is the app's own, separate from OpenHands' persistent memory. <strong>Fork</strong> copies a
+  conversation's full history and state into a new conversation, on the source's own LLM profile or on
+  another one you pick per row. <strong>Hand over</strong> starts a fresh conversation seeded with the
   conversation's <code>handover.md</code> and <em>no</em> carried context, linking back so the chain
   can be followed. <strong>Open</strong> jumps to the conversation in Canvas and
-  <strong>Delete</strong> removes it there and drops its local runtime directory; durable memory is
+  <strong>Delete</strong> removes it there and drops its local runtime directory; durable notes are
   kept.
 </p>
-<p class="note" id="memory-notice"></p>
 
 <div class="bar">
   <span class="status" id="status"></span>
@@ -39,15 +39,15 @@
   <button id="new-seeded" class="primary">Start with hook</button>
   <span class="note">Starts a conversation this app owns: it seeds the plugin into the
   conversation's runtime directory <em>before</em> creating it, so the container's first run
-  already has it, and seeds the durable memory keyed to the chosen agent profile. The plugin
-  carries a <code>handover</code> skill and a hook that logs to
+  already has it, and injects the durable notes keyed to the chosen agent profile into the launch
+  suffix. The plugin carries a <code>handover</code> skill and a hook that logs to
   <code>.openhands/handover/hook.log</code>, counts runs, and detects a handover request, plus a
   <code>spawn</code> skill: the agent writes a request to <code>.openhands/spawn/</code> and the
   backend's watcher starts a new top-level conversation for it, running the task as an
   OpenHands <em>goal</em>; when the worker finishes, the host posts its result back into the
   spawning conversation. No page needs to be open. A <code>done</code> skill lets a worker
-  leave its own completion summary, and a <code>memory</code> skill tells the agent how and
-  when to write durable memory.
+  leave its own completion summary, and a <code>notes</code> skill tells the agent how and
+  when to append durable notes.
   The conversation launches on the chosen agent profile, with the chosen LLM profile
   overriding the profile's own — the same path Canvas's own launcher uses, so the
   credentials are resolved by the Agent Server and never handled here.</span>
@@ -67,13 +67,13 @@ click the worker count on a row to expand or collapse them.</p>
   <tbody id="rows"></tbody>
 </table>
 
-<h2>Durable store</h2>
+<h2>Notes store</h2>
 <div class="bar">
-  <button id="clear-durable">Clear durable memory (debug)</button>
-  <span class="note">What new conversations are seeded from. Lines are captured automatically
-  from every conversation as it writes them; conversations keep their own copies.
-  Edit or delete a line to curate it — a change also applies to the conversation copies that
-  carry it, so the next capture does not put it back.</span>
+  <button id="clear-durable">Clear durable notes (debug)</button>
+  <span class="note">What new conversations are injected with, as standing notes.
+  Lines are captured automatically from every conversation as it writes them; conversations keep
+  their own copies. Edit or delete a line to curate it — a change also applies to the conversation
+  copies that carry it, so the next capture does not put it back.</span>
 </div>
 <div id="durable"></div>
 

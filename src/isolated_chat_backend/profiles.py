@@ -1,6 +1,6 @@
-"""Agent profiles and the durable memory tier they own.
+"""Agent profiles and the durable notes tier they own.
 
-A conversation's project/agent-profile memory is stored under the profile it ran
+A conversation's project/agent-profile notes are stored under the profile it ran
 with, not the profile that is active now. This module reads the profiles on disk
 and resolves that durable key.
 """

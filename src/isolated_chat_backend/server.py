@@ -5,10 +5,10 @@ Routes:
   GET  /health        liveness for the managed-backend bridge
   GET  /api/state     conversations + durable store, for the page
   GET  /api/spawner   the background spawner's runtime status
-  POST /api/seed      reserve an id + seed the hook plugin and memory
+  POST /api/seed      reserve an id + seed the hook plugin and notes
   POST /api/handover  build a detected conversation's successor (artifact + seed)
-  POST /api/promote   debug: union one conversation (or "all") into the durable store
-  POST /api/memory    edit or delete one durable memory line (and its copies)
+  POST /api/capture   debug: union one conversation (or "all") into the durable store
+  POST /api/notes     edit or delete one durable notes line (and its copies)
   POST /api/delete    drop one conversation's runtime directory (Canvas owns its record)
   POST /api/clear     debug-only: empty the durable store
   GET  /, /app.css, /app.js   the browser view served from ``web/``
@@ -28,13 +28,13 @@ from uuid import UUID, uuid4
 
 from . import handover, spawner
 from .hooks import seed
-from .memory import (
+from .notes import (
+    capture_conversation,
     delete_durable_line,
     durable_tier_for_path,
     edit_durable_line,
     key_for_profile,
-    promote,
-    seed_conversation,
+    notes_prompt,
 )
 from .persistence import conversation_ids, read_agent_settings, remove_runtime_dir
 from .state import clear_durable, state
@@ -123,11 +123,11 @@ class Handler(BaseHTTPRequestHandler):
             return self._seed()
         if route == "/api/handover":
             return self._handover()
-        if route == "/api/memory":
-            return self._memory_edit()
+        if route == "/api/notes":
+            return self._notes_edit()
         if route == "/api/delete":
             return self._delete()
-        if route != "/api/promote":
+        if route != "/api/capture":
             return self._json(404, {"error": "not found"})
         payload = self._payload()
         if payload is None:
@@ -135,22 +135,22 @@ class Handler(BaseHTTPRequestHandler):
         target = str(payload.get("conversation") or "all")
         known = conversation_ids(self.root)
         if target == "all":
-            results = [promote(self.root, hex_id) for hex_id in known]
+            results = [capture_conversation(self.root, hex_id) for hex_id in known]
         elif target in known:
-            results = [promote(self.root, target)]
+            results = [capture_conversation(self.root, target)]
         else:
             return self._json(404, {"error": f"unknown conversation {target!r}"})
-        return self._json(200, {"promoted": results, "state": state(self.root)})
+        return self._json(200, {"captured": results, "state": state(self.root)})
 
     def _seed(self) -> None:
-        """Reserve a conversation id, seed the hook plugin, and seed memory.
+        """Reserve a conversation id, seed the hook plugin, and frame the notes.
 
         The app starts the conversation itself (only the host page holds Agent
         Server credentials), so this prepares the host-side pieces it cannot
         make: the id it must own to seed the plugin *before* the container starts,
-        and the durable memory unioned into the conversation's runtime memory
-        files. Memory is keyed by the launch profile the page sends
-        (``agent_profile_id``), matching where capture will later union it back.
+        and the launch-suffix text the page must send so the agent receives the
+        notes in its prompt. Notes are keyed by the launch profile the page sends
+        (``agent_profile_id``), matching where capture will later union them back.
         The launch source is an Agent Profile the page resolves through the host,
         not the frozen ``agent_settings`` this host stores, so no settings are
         returned here.
@@ -169,14 +169,15 @@ class Handler(BaseHTTPRequestHandler):
         profile_key = key_for_profile(
             self.root, profile_id if isinstance(profile_id, str) else None
         )
-        memory_seed = seed_conversation(self.root, hex_id, profile_key)
         return self._json(
             200,
             {
                 "conversation_id": conversation_id,
                 "plugin": str(plugin),
                 "profile_key": profile_key,
-                "memory": memory_seed,
+                # The page forwards this as the create request's
+                # ``agent_launch_additions.system_message_suffix_append``.
+                "notes_prompt": notes_prompt(self.root, profile_key),
             },
         )
 
@@ -207,7 +208,6 @@ class Handler(BaseHTTPRequestHandler):
             self.root,
             target,
             successor_id,
-            agent_profile_id=profile_id if isinstance(profile_id, str) else None,
         )
         # The second gate: a model looks at the cheap signals before a handover
         # is automatic. Skipping it (``judge: false``) trusts the cheap gate.
@@ -219,6 +219,15 @@ class Handler(BaseHTTPRequestHandler):
             {
                 **prepared,
                 "verdict": verdict,
+                # The page forwards this as the create request's
+                # ``agent_launch_additions.system_message_suffix_append``.
+                "notes_prompt": notes_prompt(
+                    self.root,
+                    key_for_profile(
+                        self.root,
+                        profile_id if isinstance(profile_id, str) else None,
+                    ),
+                ),
             },
         )
 
@@ -240,7 +249,7 @@ class Handler(BaseHTTPRequestHandler):
         remove_runtime_dir(self.root, target)
         return self._json(200, {"deleted": target, "state": state(self.root)})
 
-    def _memory_edit(self) -> None:
+    def _notes_edit(self) -> None:
         """Edit or delete one durable line from the page's curation controls.
 
         A durable line is shared, and capture is an append-only union, so the
@@ -258,7 +267,7 @@ class Handler(BaseHTTPRequestHandler):
             return self._json(400, {"error": "path and line are required"})
         path = Path(raw_path)
         if durable_tier_for_path(self.root, path) is None:
-            return self._json(404, {"error": "not a durable memory file"})
+            return self._json(404, {"error": "not a durable notes file"})
         if payload.get("delete"):
             result = delete_durable_line(self.root, path, line)
         else:

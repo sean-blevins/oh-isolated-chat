@@ -26,7 +26,7 @@ import urllib.error
 import urllib.request
 from pathlib import Path
 
-from . import hooks, memory
+from . import hooks
 from .persistence import (
     CONVERSATION_META_REL,
     conversation_title,
@@ -167,19 +167,13 @@ def prepare(
     root: Path,
     hex_id: str,
     successor_id: str,
-    agent_profile_id: str | None = None,
 ) -> dict:
     """Do the host-side half of a handover and return the successor's launch body.
 
     Reserves nothing itself (the caller supplies the successor id so it can be
-    pre-seeded deterministically), seeds the successor's plugin and memory, writes
-    the artifact into its workspace, records the chain link on both sides, and
+    pre-seeded deterministically), seeds the successor's plugin, writes the
+    artifact into its workspace, records the chain link on both sides, and
     returns everything the host page needs to ``POST /api/conversations``.
-
-    ``agent_profile_id`` is the profile the successor will launch on (the page
-    resolves it from its own picker); its memory tier is seeded from that profile,
-    consistent with the other creation seams. When omitted, the seeded ``default``
-    profile is used.
     """
     successor_hex = successor_id.replace("-", "").lower()
     artifact = build_artifact(root, hex_id, successor_hex)
@@ -189,9 +183,6 @@ def prepare(
         parents=True, exist_ok=True
     )
     hooks.seed(root, successor_hex)
-    memory.seed_conversation(
-        root, successor_hex, memory.key_for_profile(root, agent_profile_id)
-    )
     (successor_workspace / ".openhands" / "handover" / ARTIFACT_NAME).write_text(
         artifact
     )

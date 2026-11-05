@@ -28,10 +28,10 @@ The plugin is the app's standing policy for every conversation it starts:
 * ``skills/done/SKILL.md`` -- tells a spawned *worker* how to leave its own
   completion summary (``.openhands/spawn/done.json``), which the watcher folds
   into the message it posts back to the parent.
-* ``skills/memory/SKILL.md`` -- tells the agent how and when to write durable
-  memory, and into which of the two tiers. The SDK already injects two-tier
-  guidance when ``load_memory`` is on; this adds the app's policy, because the
-  host captures ``MEMORY.md`` automatically as an append-only line union.
+* ``skills/notes/SKILL.md`` -- tells the agent how and when to append durable
+  notes, and into which of the two tiers. The app owns both halves (inject in as
+  a launch suffix, capture back as an append-only line union), so this skill is
+  the whole policy: a small reference card, never a running log.
 * ``bin/hook.sh`` -- the cheap, deterministic first stage of detection. It runs
   on every ``Stop`` (and on ``UserPromptSubmit`` to catch a trigger word), keeps
   a run counter and a marker in the workspace, and writes a *request* only when
@@ -62,10 +62,11 @@ SPAWN_SKILL_NAME = "spawn"
 # A third skill: a spawned *worker* can leave its own completion summary, which
 # the host watcher folds into the message it posts back into the parent.
 DONE_SKILL_NAME = "done"
-# A fourth skill: how and when to write durable memory, and into which tier. The
-# host seeds the durable store in and captures it back automatically, so the
-# skill's real content is the policy (one fact per line, which tier).
-MEMORY_SKILL_NAME = "memory"
+# A fourth skill: how and when to append durable notes, and into which tier. The
+# host injects the Notes store in as a launch suffix and captures it back
+# automatically, so the skill's real content is the policy (one fact per line,
+# which tier, what stays out).
+NOTES_SKILL_NAME = "notes"
 
 # Where the hook script lives inside the plugin. The command refers to it through
 # ``$HOME`` because the plugin directory is mounted at ``$HOME/plugins/<name>``.
@@ -73,14 +74,14 @@ BIN_REL = Path("bin") / "hook.sh"
 SKILL_REL = Path("skills") / SKILL_NAME / "SKILL.md"
 SPAWN_SKILL_REL = Path("skills") / SPAWN_SKILL_NAME / "SKILL.md"
 DONE_SKILL_REL = Path("skills") / DONE_SKILL_NAME / "SKILL.md"
-MEMORY_SKILL_REL = Path("skills") / MEMORY_SKILL_NAME / "SKILL.md"
+NOTES_SKILL_REL = Path("skills") / NOTES_SKILL_NAME / "SKILL.md"
 
 MANIFEST = {
     "name": SEED_PLUGIN_NAME,
-    "version": "0.4.0",
+    "version": "0.5.0",
     "description": (
         "Seeded by oh-isolated-chat: the conversation's standing hook policy and "
-        "the handover, spawn, done, and memory skills."
+        "the handover, spawn, done, and notes skills."
     ),
 }
 
@@ -270,40 +271,44 @@ This is optional -- the host also detects completion from the agent run -- but i
 is the only way to state the result in your own words, so do it.
 """
 
-# The memory skill. The SDK already injects two-tier persistent-memory guidance
-# when ``load_memory`` is on; this adds the app's own policy. The app owns both
-# halves of the loop (seed in, capture back), and capture is an append-only line
-# union that a human curates, so the skill stresses *what is worth keeping* --
-# a small reference card, never a running log -- and which tier a fact belongs
-# in. Evolving state belongs in the handover artifact or the spawn brief, not
-# here.
-_MEMORY_SKILL = """\
+# The notes skill. The app owns both halves of the loop (inject the store in as a
+# launch suffix, capture it back as an append-only line union a human curates), so
+# this skill is the whole policy: what is worth keeping -- a small reference card,
+# never a running log -- and which tier a fact belongs in. Evolving state belongs
+# in the handover artifact or the spawn brief, not here.
+_NOTES_SKILL = """\
 ---
-name: memory
-description: Record durable, reusable reference that should outlive this conversation. Use sparsely -- memory is a small reference card, not a notebook. Use when you learn how this project is built, run or tested, a lasting caveat, a stable user preference, or when the user asks you to remember something.
+name: notes
+description: Record durable, reusable reference that should outlive this conversation. Use sparsely -- notes are a small reference card, not a notebook. Use when you learn how this project is built, run or tested, a lasting caveat, a stable user preference, or when the user asks you to remember something.
 ---
 
-# Memory
+# Notes
 
-Your `MEMORY.md` files are **durable beyond this chat**: the host captures their
-lines and seeds them into every conversation that launches afterwards, so a line
-you write here becomes standing knowledge. There is no button to press.
+Your notes are **durable beyond this chat**, and they are **this app's own store,
+not OpenHands' memory**. The host injects them at the start of every conversation
+as standing guidance and captures new lines automatically -- there is no button
+to press. Do **not** write to `.openhands/memory/MEMORY.md`: that is OpenHands'
+separate persistent memory and this app neither reads nor captures it.
 
-Because it is inherited by every future conversation, memory is **expensive and
-deliberately small**. Treat it as the reference card a fresh teammate reads
+Because notes are inherited by every future conversation, they are **expensive
+and deliberately small**. Treat them as the reference card a fresh teammate reads
 before touching the repo -- not as context, notes, or a transcript. Most turns
 should write nothing.
 
 ## Two tiers
 
-- **User memory** -- the *User memory* directory named in your `<MEMORY>` context
-  (`$HOME/memory/MEMORY.md` in this container). About the *person*: their name
-  and role, how they like to work, standing preferences and corrections. Every
-  project on this host sees these lines.
-- **Project memory** -- `.openhands/memory/MEMORY.md` under the workspace root.
-  Durable *reference* about this codebase: how to build, run and test it, where
-  the important things live, environment caveats, tooling choices, project-wide
-  conventions. Every conversation on this agent profile sees these lines.
+- **Global notes** -- `$HOME/notes/NOTES.md` in this container. About the
+  *person*: their name and role, how they like to work, standing preferences and
+  corrections. Every project on this host sees these lines.
+- **Project notes** -- `.openhands/notes/NOTES.md` under the workspace root.
+  Durable *reference* about this codebase and this agent profile: how to build,
+  run and test it, where the important things live, environment caveats, tooling
+  choices, project-wide conventions. Every conversation on this agent profile
+  sees these lines.
+
+Neither file is created for you -- a conversation that has written nothing has
+no notes file. Create the right one (and its directory) the first time you have a
+fact worth keeping.
 
 ## What belongs (write these)
 
@@ -330,18 +335,19 @@ wrong or slow without this line?** If not, do not write it.
 
 ## How to write
 
-- One durable fact per line, starting with `- `. A reader may see the line
-  alone, so make it self-contained:
+- Create the file first if it is missing (`mkdir -p` its directory, then write).
+  Then append one durable fact per line, starting with `- `. A reader may see the
+  line alone, so make it self-contained:
   `- Tests: python3 -m pytest tests/ (stdlib only, no deps)`.
-- **Prefer editing an existing line over appending a new one.** If a fact
-  changed, replace the old line; if two lines say almost the same thing, merge
-  them. Keep the card tight.
+- **Prefer editing an existing line over appending a new one.** If a fact changed,
+  replace the old line; if two lines say almost the same thing, merge them. Keep
+  the card tight.
 - Never re-wrap or reorder unrelated lines. Capture is an append-only union and a
   human curates the durable store, so a cleanup you make here may not delete the
   stored copy -- keep writes clean at the source instead.
-- Keep each tier small. The SDK loads only the first ~6000 characters of both
-  tiers combined, and when a file is over budget it drops the **oldest** lines
-  first -- so an oversized file loses the foundational facts you meant to keep.
+- Keep each tier small. Both tiers together are injected up to about 32,000
+  characters; past that the store drops the **oldest** lines first, so an
+  oversized file loses the foundational facts you meant to keep.
 """
 
 
@@ -372,7 +378,7 @@ def seed(root: Path, hex_id: str) -> Path:
     """Write the seed plugin into a conversation's runtime dir (idempotent).
 
     Writes the manifest, the hooks config, the hook script (executable), and the
-    handover, spawn, done, and memory skills. Re-seeding overwrites in place
+    handover, spawn, done, and notes skills. Re-seeding overwrites in place
     rather than stacking up.
     """
     plugin = plugin_dir(root, hex_id)
@@ -392,7 +398,7 @@ def seed(root: Path, hex_id: str) -> Path:
         (SKILL_REL, _SKILL),
         (SPAWN_SKILL_REL, _SPAWN_SKILL),
         (DONE_SKILL_REL, _DONE_SKILL),
-        (MEMORY_SKILL_REL, _MEMORY_SKILL),
+        (NOTES_SKILL_REL, _NOTES_SKILL),
     ):
         skill = plugin / rel
         skill.parent.mkdir(parents=True, exist_ok=True)

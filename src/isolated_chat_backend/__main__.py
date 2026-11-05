@@ -6,16 +6,17 @@ import argparse
 from http.server import ThreadingHTTPServer
 from pathlib import Path
 
+from . import notes
 from .persistence import find_persistence_root
 from .server import Handler
 from .spawner import SpawnerConfigError, Watcher, load_config
 
 
 def start_watcher(root: Path, data_dir: Path) -> Watcher:
-    """Start the background watcher: memory capture always, spawns when possible.
+    """Start the background watcher: notes capture always, spawns when possible.
 
-    The watcher has two jobs. Memory capture needs nothing but the host
-    filesystem -- a conversation's ``MEMORY.md`` is already bind-mounted into its
+    The watcher has two jobs. Notes capture needs nothing but the host
+    filesystem -- a conversation's ``NOTES.md`` is already bind-mounted into its
     runtime directory -- so it always runs. Spawning a conversation needs Agent
     Server access, discovered from the parent process (with an optional
     ``spawner.json`` override); when there is nothing to discover, spawns are
@@ -29,7 +30,7 @@ def start_watcher(root: Path, data_dir: Path) -> Watcher:
     if config is None:
         print(
             "[oh-isolated-chat] spawns disabled: no Agent Server credentials "
-            "discovered (set <data-dir>/spawner.json to enable); memory capture "
+            "discovered (set <data-dir>/spawner.json to enable); notes capture "
             "still on",
             flush=True,
         )
@@ -44,7 +45,7 @@ def start_watcher(root: Path, data_dir: Path) -> Watcher:
     )
     print(
         f"[oh-isolated-chat] watcher on {root / 'runtime-data'}/* "
-        f"(memory capture + spawns {target})",
+        f"(notes capture + spawns {target})",
         flush=True,
     )
     return watcher
@@ -59,6 +60,14 @@ def main() -> None:
     root = find_persistence_root(Path(args.data_dir))
     print(f"[oh-isolated-chat] persistence root: {root}", flush=True)
     print(f"[oh-isolated-chat] data dir: {args.data_dir}", flush=True)
+
+    migrated = notes.migrate_legacy_store(root)
+    if migrated:
+        print(
+            "[oh-isolated-chat] migrated legacy memory store to notes: "
+            + ", ".join(migrated),
+            flush=True,
+        )
 
     Handler.root = root
     Handler.watcher = start_watcher(root, Path(args.data_dir))

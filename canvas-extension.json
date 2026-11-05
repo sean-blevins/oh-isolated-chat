@@ -3,7 +3,7 @@
   "name": "oh-isolated-chat",
   "display_name": "Isolated Docker Chat",
   "version": "0.1.0",
-  "description": "The host-side home for isolated Docker conversations: start a new conversation with a seeded hook and memory, capture its memory back into the durable store automatically, and fork a conversation into a new one with its full history.",
+  "description": "The host-side home for isolated Docker conversations: start a new conversation with a seeded plugin, inject and capture its durable Notes automatically, and fork a conversation into a new one with its full history.",
   "entrypoint": "extension.js",
   "contributes": {
     "pages": [
@@ -12,7 +12,7 @@
         "title": "Isolated Docker Chat",
         "path": "/chat",
         "nav_label": "Isolated chat",
-        "description": "Conversations, their memory, and the host-side actions that isolated runtimes cannot perform themselves."
+        "description": "Conversations, their durable Notes, and the host-side actions that isolated runtimes cannot perform themselves."
       }
     ]
   },
@@ -21,7 +21,7 @@
     "artifacts": {
       "linux-amd64": {
         "path": "backend/linux-amd64.tar.gz",
-        "sha256": "43bf346eef5a3212e12d358abc680ba9055409671e42594dc6ae07d22b46107b"
+        "sha256": "e6c5037d0146bf6e6ebebadd38456476599aba2da1602b65f340dcb55a8f392f"
       }
     },
     "argv": [

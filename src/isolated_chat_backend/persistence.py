@@ -1,8 +1,8 @@
 """The host persistence store, as this app reads it.
 
 Every isolated conversation keeps its runtime directory under
-``<persistence>/runtime-data/<hex>/`` and its durable, host-only memory beside
-it. This module owns that layout: where each file lives, which runtime
+``<persistence>/runtime-data/<hex>/`` and its durable, host-only Notes store
+beside it. This module owns that layout: where each file lives, which runtime
 directories exist, and how a conversation's stored record is turned into the
 name and tags Canvas shows.
 """
@@ -14,13 +14,17 @@ import re
 import shutil
 from pathlib import Path
 
-# Conversation-local memory, keyed to paths the SDK's own `load_memory` reads.
-GLOBAL_REL = Path("persistence") / "memory" / "MEMORY.md"
-PROJECT_REL = Path("workspace") / ".openhands" / "memory" / "MEMORY.md"
+# Conversation-local Notes, where the agent appends and the host captures from.
+# Deliberately NOT under ``memory/``: OpenHands' own ``load_memory`` reads
+# ``memory/MEMORY.md``, and this store must not be pulled in by it -- the host
+# injects Notes explicitly as a launch suffix instead.
+GLOBAL_REL = Path("persistence") / "notes" / "NOTES.md"
+PROJECT_REL = Path("workspace") / ".openhands" / "notes" / "NOTES.md"
 
 # Durable, host-only store that new conversations are seeded from.
-DURABLE_GLOBAL_REL = Path("memory") / "MEMORY.md"
-DURABLE_PROFILE_DIR = Path("memory") / "agents"
+NOTES_INDEX_NAME = "NOTES.md"
+DURABLE_GLOBAL_REL = Path("notes") / "NOTES.md"
+DURABLE_PROFILE_DIR = Path("notes") / "agents"
 
 # The conversation's stored start record (Canvas-owned).
 CONVERSATION_META_REL = Path("agent-canvas") / "dev_conversations"
@@ -171,25 +175,6 @@ def read_agent_settings(root: Path) -> dict | None:
         return None
     settings = data.get("agent_settings")
     return settings if isinstance(settings, dict) else None
-
-
-def read_load_memory(root: Path) -> bool | None:
-    """Whether Canvas's agent context loads persistent memory, or None if unknown.
-
-    ``load_memory`` is a host-wide setting, not per conversation: both the local
-    and Docker launch paths read it from ``settings.json``. When it is off, the
-    SDK never reads a conversation's ``MEMORY.md``, so seeded or captured memory
-    is inert -- surfaced here so the page can say so instead of silently doing
-    nothing. None means the file or field could not be read.
-    """
-    try:
-        data = json.loads((root / SETTINGS_REL).read_text())
-    except (OSError, ValueError):
-        return None
-    settings = data.get("agent_settings")
-    context = settings.get("agent_context") if isinstance(settings, dict) else None
-    value = context.get("load_memory") if isinstance(context, dict) else None
-    return value if isinstance(value, bool) else None
 
 
 def conversation_title(record: dict) -> str:

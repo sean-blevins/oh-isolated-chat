@@ -29,7 +29,7 @@ const tierCell = (tier) => {
 // Canvas records the profile a conversation was launched with, except for a
 // local OpenHands launch on the seeded `default` profile: that goes through
 // global agent_settings and records nothing. So no record means `default`, and
-// that profile's folder owns the conversation's memory.
+// that profile's folder owns the conversation's notes.
 const profileLabel = (convo) => {
   const name = convo.profile_name || convo.profile_key;
   const id = `<code>${escapeHtml(short(convo.profile_key))}</code>`;
@@ -314,30 +314,8 @@ function appendTree(rows, convo, children, depth) {
 const expanded = new Set();
 let lastState = null;
 
-// The host-wide Canvas setting that decides whether a conversation's MEMORY.md is
-// ever read. It is not the app's to change, so when it is off the page says so:
-// seeding and capture still happen, but they are inert until Canvas loads memory.
-function renderMemoryNotice(loadMemory) {
-  const notice = $("memory-notice");
-  if (loadMemory === true) {
-    notice.className = "note";
-    notice.textContent = "";
-  } else if (loadMemory === false) {
-    notice.className = "note warn";
-    notice.textContent =
-      "Memory is inert: Canvas's host-wide “load persistent memory” setting is off, so "
-      + "conversations never read the MEMORY.md this page seeds and captures. Turn it on "
-      + "in Canvas's agent settings to use memory.";
-  } else {
-    notice.className = "note";
-    notice.textContent =
-      "Could not read Canvas's “load persistent memory” setting; memory may be inert.";
-  }
-}
-
 function render(state) {
   lastState = state;
-  renderMemoryNotice(state.load_memory);
   const rows = $("rows");
   rows.replaceChildren();
   if (!state.conversations.length) {
@@ -359,11 +337,11 @@ function render(state) {
     const p = document.createElement("p");
     p.className = "empty";
     p.textContent =
-      "The durable store is empty. It fills automatically as conversations write memory.";
+      "The Notes store is empty. It fills automatically as conversations write notes.";
     durable.append(p);
     return;
   }
-  const budget = state.memory_char_budget ?? 6000;
+  const budget = state.notes_char_budget ?? 32768;
   let chars = 0;
   for (const file of state.durable) {
     chars += file.chars ?? 0;
@@ -372,11 +350,12 @@ function render(state) {
   const note = document.createElement("p");
   note.className = chars > budget ? "note warn" : "note";
   note.textContent =
-    `${chars} characters stored. A conversation loads the global tier plus one `
-    + `profile tier, which the SDK caps at ${budget} characters; over budget it `
-    + `drops the oldest lines first, so keep this a small reference card. `
-    + `Edit or delete a line here — the change also applies to the conversation `
-    + `copies that carry it, so the next capture does not put it back.`;
+    `${chars} characters stored. A conversation is started with the global tier plus `
+    + `one profile tier injected as standing notes, up to ${budget} characters; over `
+    + `budget the oldest lines are dropped first. This is the app's own Notes store, `
+    + `separate from OpenHands' memory. Edit or delete a line here — the change also `
+    + `applies to the conversation copies that carry it, so the next capture does not `
+    + `put it back.`;
   durable.append(note);
 }
 
@@ -432,12 +411,12 @@ function editDurableLine(row, file, line) {
   const save = document.createElement("button");
   save.className = "primary";
   save.textContent = "Save";
-  save.addEventListener("click", () => sendMemoryEdit(file.path, line, input.value));
+  save.addEventListener("click", () => sendNotesEdit(file.path, line, input.value));
   const cancel = document.createElement("button");
   cancel.textContent = "Cancel";
   cancel.addEventListener("click", () => refresh());
   input.addEventListener("keydown", (event) => {
-    if (event.key === "Enter") sendMemoryEdit(file.path, line, input.value);
+    if (event.key === "Enter") sendNotesEdit(file.path, line, input.value);
     if (event.key === "Escape") refresh();
   });
   row.append(input, save, cancel);
@@ -449,12 +428,12 @@ async function deleteDurableLine(file, line) {
     `Delete this durable line?\n\n${line}\n\nIt is removed from ${file.name} and `
     + `from the conversations that carry it.`,
   );
-  if (ok) await sendMemoryEdit(file.path, line, null);
+  if (ok) await sendNotesEdit(file.path, line, null);
 }
 
-async function sendMemoryEdit(path, line, text) {
-  $("status").textContent = text === null ? "deleting memory line…" : "saving memory line…";
-  const response = await fetch("api/memory", {
+async function sendNotesEdit(path, line, text) {
+  $("status").textContent = text === null ? "deleting notes line…" : "saving notes line…";
+  const response = await fetch("api/notes", {
     method: "POST",
     headers: { "Content-Type": "application/json" },
     body: JSON.stringify(
@@ -463,11 +442,11 @@ async function sendMemoryEdit(path, line, text) {
   });
   const body = await response.json();
   if (!response.ok) {
-    $("status").textContent = body.error ?? "memory edit failed";
+    $("status").textContent = body.error ?? "notes edit failed";
     return;
   }
   $("status").textContent = body.changed
-    ? (text === null ? "memory line deleted" : "memory line saved")
+    ? (text === null ? "notes line deleted" : "notes line saved")
     : "no matching durable line";
   render(body.state);
 }
@@ -482,7 +461,7 @@ async function refresh() {
 }
 
 // The background watcher's own status. It has two halves and they report
-// separately: memory capture always runs (it needs only the host filesystem),
+// separately: notes capture always runs (it needs only the host filesystem),
 // while spawns need Agent Server credentials and may be off. A spawn needs no
 // page open, so this is the only place a stall becomes visible.
 async function loadSpawner() {
@@ -500,7 +479,7 @@ async function loadSpawner() {
     const captured = status.captured ?? 0;
     const when = status.last_capture ? `, last pass ${status.last_capture}` : "";
     const note =
-      `Memory capture: on — ${captured} conversation memory file(s) merged into the `
+      `Notes capture: on — ${captured} conversation notes file(s) merged into the `
       + `durable store${when}` + (status.last_error ? ` (last error: ${status.last_error})` : "");
     $("capture").textContent = note;
   } catch {
@@ -672,6 +651,18 @@ function launchSource() {
   return source;
 }
 
+// Fold the backend's Notes prompt into a create's `agent_launch_additions`,
+// alongside any per-launch LLM override. The host injected notes as this launch
+// suffix, which is what makes the agent receive the durable store in its prompt;
+// it is the app's own store, not OpenHands' memory.
+function withNotes(source, notesPrompt) {
+  const additions = { ...(source.agent_launch_additions ?? {}) };
+  if (notesPrompt) additions.system_message_suffix_append = notesPrompt;
+  return Object.keys(additions).length
+    ? { ...source, agent_launch_additions: additions }
+    : source;
+}
+
 async function fork(convo) {
   const profile = forkProfiles.get(convo.id) ?? "";
   $("status").textContent = `forking ${short(convo.id)}…`;
@@ -713,11 +704,11 @@ async function deleteConversation(convo) {
   const warning = convo.has_record
     ? `Permanently delete “${label}”?\n\nCanvas loses the conversation and its `
       + "history, and its local runtime directory (sandbox home, workspace, and "
-      + "the memory it still carries) is removed. Durable memory in the store "
-      + "is kept."
+      + "the notes it still carries) is removed. Durable notes in the store "
+      + "are kept."
     : `Remove the leftover runtime directory for “${label}”?\n\nCanvas has no `
-      + "record for it, so this only deletes the local directory. Durable memory "
-      + "in the store is kept.";
+      + "record for it, so this only deletes the local directory. Durable notes "
+      + "in the store are kept.";
   if (!window.confirm(warning)) return;
   $("status").textContent = `deleting ${short(convo.id)}…`;
   const result = await hostRequest(
@@ -744,9 +735,10 @@ async function deleteConversation(convo) {
 // runs the model judgement; ``auto`` respects a "hold" verdict, a manual click
 // is the user overruling it.
 async function handOver(convo, { auto = false } = {}) {
-  // Resolve the launch profile before any side effect: the backend seeds the
-  // successor's memory from it, so it must be known up front, and a missing
-  // profile should fail without half-preparing a successor.
+  // Resolve the launch profile before any side effect: the backend frames the
+  // successor's notes injection from it, and the create launches on it, so it
+  // must be known up front; a missing profile should fail without half-preparing
+  // a successor.
   const source = launchSource();
   if (!source) {
     $("status").textContent = "No agent profile is available to launch on.";
@@ -778,7 +770,7 @@ async function handOver(convo, { auto = false } = {}) {
   const secrets = buildSecrets();
   const result = await hostRequest("POST", "/api/conversations", {
     conversation_id: id,
-    ...source,
+    ...withNotes(source, prepared.notes_prompt),
     ...(secrets ? { secrets } : {}),
     // No parent_conversation_id: the Docker runtime rejects a parent its new
     // container cannot see. The `handoverfrom` tag carries the chain instead.
@@ -836,8 +828,8 @@ async function startSeeded() {
   const response = await fetch("api/seed", {
     method: "POST",
     headers: { "Content-Type": "application/json" },
-    // The profile the conversation will launch on: the backend seeds that
-    // profile's durable memory tier into the conversation before it starts.
+    // The agent profile the conversation will launch on: the backend frames
+    // that profile's durable notes tier for injection as the launch suffix.
     body: JSON.stringify({ agent_profile_id: source.agent_profile_id }),
   });
   const seeded = await response.json();
@@ -850,11 +842,12 @@ async function startSeeded() {
   // Only the host page holds Agent Server credentials, so it performs the
   // create. It gets the id we already seeded and the agent profile to launch
   // on; the Agent Server resolves the profile's credentials and materializes the
-  // secrets the profile's `secret_refs` allow.
+  // secrets the profile's `secret_refs` allow. The backend's Notes prompt rides
+  // along as the launch suffix.
   const secrets = buildSecrets();
   const result = await hostRequest("POST", "/api/conversations", {
     conversation_id: id,
-    ...source,
+    ...withNotes(source, seeded.notes_prompt),
     ...(secrets ? { secrets } : {}),
     initial_message: { role: "user", content: [{ type: "text", text: message }] },
   });
@@ -873,7 +866,7 @@ async function startSeeded() {
 async function clearDurable() {
   if (
     !window.confirm(
-      "Delete every durable memory line? Conversations keep their own copies, so the next " +
+      "Delete every durable notes line? Conversations keep their own copies, so the next " +
         "capture pass restores what they still carry.",
     )
   ) {

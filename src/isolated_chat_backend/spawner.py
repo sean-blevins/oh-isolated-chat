@@ -58,7 +58,7 @@ from typing import Callable
 from urllib.parse import quote
 from uuid import uuid4
 
-from . import hooks, memory
+from . import hooks, notes
 from .persistence import (
     RUNTIME_DATA_REL,
     read_conversation_record,
@@ -636,6 +636,7 @@ def build_worker_payload(
     agent_profile_id: str,
     llm_profile_ref: str | None,
     goal: bool,
+    notes_prompt: str | None = None,
 ) -> dict:
     """The ``POST /api/conversations`` body for a worker.
 
@@ -647,6 +648,11 @@ def build_worker_payload(
     the goal is started in a second call. Without a goal, ``initial_message``
     makes the create start the worker's first turn in the same call -- which is
     what makes a non-goal spawn run without anyone watching.
+
+    ``notes_prompt`` is the durable Notes store framed for injection; like the
+    app's own page start it travels as ``agent_launch_additions``'s
+    ``system_message_suffix_append``, alongside any LLM-profile override, so a
+    worker inherits the standing notes its profile owns.
     """
     payload: dict = {
         "conversation_id": conversation_id,
@@ -658,8 +664,13 @@ def build_worker_payload(
             "role": "user",
             "content": [{"type": "text", "text": request.task}],
         }
+    additions: dict[str, str] = {}
     if llm_profile_ref:
-        payload["agent_launch_additions"] = {"llm_profile_ref": llm_profile_ref}
+        additions["llm_profile_ref"] = llm_profile_ref
+    if notes_prompt:
+        additions["system_message_suffix_append"] = notes_prompt
+    if additions:
+        payload["agent_launch_additions"] = additions
     if request.title:
         payload["title"] = request.title
     return payload
@@ -744,9 +755,9 @@ def spawn_worker(
     Seeding happens before the create because a non-goal request with an
     ``initial_message`` starts running inside the create call -- writing the
     plugin afterwards would miss the container's first run (the same ordering
-    the app's own seeded start uses). The launch profile is resolved *before*
-    seeding so the worker's memory can be seeded from the tier that profile
-    owns. A goal worker is created idle and given its goal in a second call.
+    the app's own seeded start uses). The launch profile is resolved first so
+    the worker's notes can be framed from the tier that profile owns. A goal
+    worker is created idle and given its goal in a second call.
 
     If the goal cannot be started (an Agent Server without ``/goal``), the task
     falls back to a normal ``run`` message, so a spawn still does work.
@@ -759,14 +770,18 @@ def spawn_worker(
     conversation_hex = conversation_id.replace("-", "").lower()
     agent_profile_id = resolve_agent_profile(client, root, parent_hex, request, config)
     seed(root, conversation_hex)
-    memory.seed_conversation(
-        root, conversation_hex, memory.key_for_profile(root, agent_profile_id)
-    )
+    profile_key = notes.key_for_profile(root, agent_profile_id)
     llm_profile_ref = request.llm_profile_ref or config.llm_profile_ref
     goal = request.goal if request.goal is not None else config.goal
     max_iterations = request.max_iterations or config.max_iterations
     payload = build_worker_payload(
-        conversation_id, parent_hex, request, agent_profile_id, llm_profile_ref, goal
+        conversation_id,
+        parent_hex,
+        request,
+        agent_profile_id,
+        llm_profile_ref,
+        goal,
+        notes_prompt=notes.notes_prompt(root, profile_key),
     )
     secrets = build_secret_refs(client)
     if secrets:
@@ -948,12 +963,12 @@ class Watcher:
     failure and set aside after :data:`MAX_ATTEMPTS` so a permanent error cannot
     spin forever.
 
-    The same loop also **captures memory**: a conversation's ``MEMORY.md`` files
+    The same loop also **captures notes**: a conversation's ``NOTES.md`` files
     are host-visible through the bind mount, so it unions any that changed into
-    the durable store (see :func:`memory.capture`), with no button and no Agent
+    the durable store (see :func:`notes.capture`), with no button and no Agent
     Server call. This half runs even when ``config`` is ``None`` -- i.e. when no
     Agent Server credentials were discovered and spawns are off -- because
-    capture needs neither, and a page-less stack should still keep memory.
+    capture needs neither, and a page-less stack should still keep notes.
     """
 
     def __init__(
@@ -982,8 +997,8 @@ class Watcher:
         self._thread: threading.Thread | None = None
         self._last_completion = 0.0
         # The capture loop's fingerprint cache (hex -> (mtime_ns, size) per
-        # memory file), so a steady conversation costs a couple of stat calls.
-        self._seen_memory: dict[str, object] = {}
+        # notes file), so a steady conversation costs a couple of stat calls.
+        self._seen_notes: dict[str, object] = {}
         self._stats = {
             "scans": 0,
             "spawned": 0,
@@ -1013,8 +1028,8 @@ class Watcher:
                 created.append(worker_id)
         return created
 
-    def capture_memory(self) -> list[str]:
-        """Union changed conversation memory files into the durable store.
+    def capture_notes(self) -> list[str]:
+        """Union changed conversation notes files into the durable store.
 
         Returns the conversation ids that contributed a line this pass. Runs
         without any Agent Server access, so it is the one part of the loop that
@@ -1023,11 +1038,11 @@ class Watcher:
         self._stats["last_capture"] = time.strftime(
             "%Y-%m-%dT%H:%M:%SZ", time.gmtime()
         )
-        captured = memory.capture(self.root, self._seen_memory)
+        captured = notes.capture(self.root, self._seen_notes)
         if captured:
             self._stats["captured"] += len(captured)
             self._logger(
-                "captured memory from %s conversation(s): %s"
+                "captured notes from %s conversation(s): %s"
                 % (len(captured), ", ".join(captured))
             )
         return captured
@@ -1159,11 +1174,11 @@ class Watcher:
             # Capture first: it needs no Agent Server, and it is the half that
             # must keep running on a stack where spawns are disabled.
             try:
-                self.capture_memory()
+                self.capture_notes()
             except Exception as exc:  # noqa: BLE001 - the watcher must outlive errors
                 self._stats["errors"] += 1
                 self._stats["last_error"] = str(exc)
-                self._logger(f"memory capture failed: {exc}")
+                self._logger(f"notes capture failed: {exc}")
             if spawns_on:
                 try:
                     self.scan_once()
